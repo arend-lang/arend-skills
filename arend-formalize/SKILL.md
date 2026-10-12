@@ -194,6 +194,7 @@ Goal: a typechecking file where the only remaining errors are the `{?}`s represe
 - `grep -n '{?}'` over every file touched. A `{?}` must never reach a commit.
 - `-fu` every new definition. `No usages.` → delete it.
 - No lemma whose body is `idp`; no `pmap f idp` step; no lemma that is a partial application of another (`f a b 0`).
+- **No lemma whose body is a bare, argument-free tactic call** — `equation.group`, `equation.cRing`, `linarith`, `simplify`. If a decision procedure closes the statement unaided, writing that procedure at the call site is shorter than writing the lemma's name, so the lemma is pure decoration. A tactic *with* a hand-supplied bridge (`equation.group {pmap (* h) p}`) is the opposite: the bridge is the content, and the lemma stays. User's rule, applied to `Algebra/Group.ard` on 2026-09-14 — eight of fifteen new commutator lemmas went.
 
 ### 2. Naming — check every new name against this table
 
@@ -277,7 +278,45 @@ Daemon poisoning: a transient resolution error (a duplicate name, a half-saved f
 
 ### "Cannot infer implicit X" inside a `\where`-block lemma calling its outer lemma
 
-`\where`-private lemmas don't inherit the outer's implicit binders even when they syntactically reference outer variables. When recursing — or calling sibling private lemmas — pass the outer implicits explicitly: `outer-lemma {A} {b} {x} N` instead of `outer-lemma N`. Alternative: avoid `\where` and put helpers at top-level (still `\private`).
+A `\where` member of a *parameterised* `\func` **does** inherit that `\func`'s parameters as hidden
+implicits — `SubMonoid.closure.univ` and `.apl-inc` use `closure`'s `M` and `S` without declaring
+them, and `-ss` prints their signatures without them. (An earlier revision of this entry said they
+are *not* inherited; that is wrong, and it is why the references resolve at all.) What does not
+happen is those implicits being *propagated* when one **sibling** calls another: there they become
+ordinary metavariables at the call site, so pass them explicitly — `outer-lemma {A} {b} {x} N`
+instead of `outer-lemma N`. Alternative: avoid `\where` and put helpers at top-level (still
+`\private`).
+
+**The parent's own body, and a member's recursive self-call, do *not* need the pinning.** Verified
+2026-09-14 on `Algebra/Group/Free.ard`: `FreeGroup.lift-unique.char` declares no parameters at all
+and uses its parent's `{S} {G} {i} {f}`; both `char a` (from `lift-unique`'s body) and `char l`
+(from `char` itself) typecheck with every implicit left out — including `i`, which does not occur in
+`char`'s type and would be an unsolvable metavariable if it were passed as one. So a one-consumer
+helper *can* be nested in its consumer's `\where` and shed its parameters; it is only the
+sibling-to-sibling edge that costs pinning. (An earlier revision said "when recursing" too — wrong.)
+
+**The second surface form is a `Type mismatch`, not `Cannot infer`.** If the sibling's parameter type
+is a class application (`(H : SubGroup G)`, `G` inherited) and you pass a `\cowith`-defined value
+whose type carries its implemented fields, the expected type is not ground when the subtype coercion
+is checked and you get a mismatch that reads as a contradiction — the solved field implementations
+are elided on the *expected* side and printed in full on the *actual* side:
+
+```
+[ERROR] Type mismatch
+  Expected type: SubGroup G
+    Actual type: SubGroup G (\lam (x : G.E) => TruncP (\Sigma (n : Nat) (contains x)))
+  In: closure S'
+```
+
+Same read-as-contradiction shape as **arend-prove** failure modes 15/18/20, same fix as above: pin
+`{G} {S}` and it goes away. Verified deterministic (13/13, warm and cold daemon) on
+`Algebra/Group/SubGroup.ard` 2026-09-14 — do not mistake this for flakiness, as I once did.
+
+**Corollary for statements, not just call sites:** `closure S <= closure S'` between two such values
+finds no `Poset` instance at all (`Cannot infer an instance of class 'Preorder' with classifying
+expression: SubGroup G (\lam x => …)`), and pinning it as `<= {SubGroupPoset}` fails the same way as
+above. State the relation pointwise instead — `(x : G) (q : closure S x) : closure S' x` *is*
+`SubsetPoset.<=` unfolded, so nothing is lost, and it is what `Ideal.sclosure-mono` already does.
 
 ---
 
@@ -297,6 +336,7 @@ Daemon poisoning: a transient resolution error (a duplicate name, a half-saved f
 | "Resolution candidates + `.sig` mirror + index refresh." | `-ai [MODULE[:DEF]]` |
 | "Ignore stale binary caches after a refactor or a hang." | `--no-daemon -r` (plain `-r` is ignored by the daemon) |
 | "The daemon is wedged / denies a visible definition." | `--daemon-stop`, then `-d` again |
+| "Which definitions are slow?" | `--no-daemon -r --show-times [MODULE[:DEF]]` (`--show-sizes` for core-term sizes). A `:DEF`-scoped run checks only that definition's dependencies. Not daemon-served: the daemon re-checks only definitions whose resolved AST changed, so it reports ~0ms for the rest. For bisection, add variant definitions to a scratch copy of the library and time them all in one run. Cause and cures: **arend-quirks** §7. |
 
 ### `-ss` dialect reference
 

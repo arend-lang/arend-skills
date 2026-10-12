@@ -76,6 +76,7 @@ If you find yourself wanting a 1–5 line helper that should exist (`partialSum_
 | `run`, `in`, `at`, `cases`, `mcases`, `unfold`, `assumption`, `later` | `Meta` |
 | `$`, `#`, `repeat`, `__` (anonymous-section placeholder) | `Function.Meta` |
 | `equation`, `cong`, `linarith`, `simplify` | `Algebra.Meta` |
+| `Quotient`, `in~`, `~-equiv`, `Equivalence` | `Relation.Equivalence` |
 | `Empty`, `Not`, `&&`, `||`, `propExt` (the type) | `Logic` |
 | `contradiction`, `cases`-style logic helpers | `Logic.Meta` |
 | `Pointed`, `Monoid`, `Group`, `Ring`, `Semiring` classes | `Algebra.{Pointed,Monoid,Group,Ring,Semiring}` |
@@ -135,6 +136,16 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 9. **A meta inside `run { ... }` with a mysterious type error usually wants `later $`.** `later` (from `Meta`) defers a meta invocation until type inference has resolved more of the expected type. When the intermediate goal at some position in a `run` chain isn't pinned down enough for the meta to fire, prefix with `later $`: `run { later $ rewrite p, idp }`. Rule of thumb: if a meta in the middle of a `run` complains about an unresolved goal but the same meta works on its own, try `later $`.
 
 10. **`equation` defaults to the non-commutative ring solver.** If you call plain `equation` on an identity that needs `*`-commutativity (e.g. anything over `Rat`, `Real`, or any concrete commutative ring), it fails with `Ring solver failed` and the printout shows the two sides differing only by argument order — `v0*v1*v2` vs `v2*v0*v1`. The error message doesn't suggest the fix. Use `equation.cRing` for commutative rings, `equation.cMonoid` for commutative monoids, `equation.monoid` for non-commutative monoids. Established practice in `Algebra/Ring/Localization.ard` and `Algebra/Linear/Matrix.ard`. When the structure is *abstract* (`{R : CRing}` etc.), `equation` may pick the right solver from the class — but for concrete arithmetic over `Rat`/`Real`/`Nat` you almost always need the explicit `.cRing` qualifier. **In-chain vs bare ascription:** the *standalone* `(equation.cRing : LHS = RHS)` over concrete `Rat` fails with `Cannot infer an instance of class 'CRing' with classifying expression: Rat` (nothing drives the instance), but the *same* `equation.cRing` embedded in a `*>` chain — `inv (equation.cRing *> pmap (…) lemma *> …)` — infers fine because the chain position pins its expected type. So when ascription fails, drop the ascription and let the chain pin the type rather than adding `{instance}` or a hand-written rearrange helper.
+
+    **There is no commutative-*rng* solver, and the fallback is silent.** At `{R : PseudoCRing}`
+    (no `ide`) `equation` dispatches to the **Monoid** solver, so it loses both commutativity and
+    distribution and fails on identities it closes instantly one class up. The tell is the solver
+    named in the error, not the goal: `Monoid solver failed` on sides that differ only by
+    `*`-commutativity or a distribution step. `equation.cRing` needs a unital `CRing` and
+    `equation.cMonoid` a unital `CMonoid`, so neither substitutes. Verified 2026-09-14 while
+    testing whether `Algebra/Ring/Homotope.ard` weakens from `CRing` to `PseudoCRing`: four
+    one-word proofs would have become hand-written chains. If you need rng-level algebra, write
+    the chains (`pmap (* z) *-assoc *> *-assoc` and friends) or keep the unital hypothesis.
 
 11. **`linarith` over `Real` finds its instance with just `\import Arith.Real.Field`** (since commit `ab3dc1dba`, which added `solveEquationsFor` to push a single inference variable). The old quirk — "needs `\open RealField`, instance resolution is unstable if multiple `linarith` calls coexist without the open" — no longer reproduces; verified with both implicit `{x : Real}` and explicit `(x y : Real)` parameters, with and without multiplication. If you still see `Cannot infer an instance of class 'LinearlyOrderedSemiring' with classifying expression: Real`, check the import is actually present; `\open RealField` is no longer required. (For `Rat`, `\import Arith.Rat` suffices for the same reason; for abstract `{R : LinearlyOrderedSemiring}` the instance was always pinned by the parameter.)
 
@@ -243,14 +254,110 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
 
     Two habits that paid off around this:
 
-    - **Find pivots and check statements out of band.** A 20-line free-group reduced-word checker (stack-based cancellation over `[(gen, sign)]`) decides candidate pivots and conjugacy instantly; guessing against `arend` costs a round each and the failures are uninformative. It is also what caught that a *stated* identity was false: `arend-formalization.md`'s proposed `commutator-hall-witt` does not hold in arend-lib's conventions (`commutator g h = g h g⁻¹ h⁻¹`, `conjugate g h = g h g⁻¹`); the correct cyclic form `commutator (commutator a b) (conjugate b c) * commutator (commutator b c) (conjugate c a) * commutator (commutator c a) (conjugate a b) = ide` is a one-line `equation.group`. For *conditional* identities, where a free-group check does not apply, sampling in `S6` is the cheap second opinion.
+    - **Find pivots and check statements out of band.** A 20-line free-group reduced-word checker (stack-based cancellation over `[(gen, sign)]`) decides candidate pivots and conjugacy instantly; guessing against `arend` costs a round each and the failures are uninformative. It is also what caught that a *stated* identity was false: `arend-formalization.md`'s proposed Hall–Witt identity does not hold in arend-lib's conventions (`commutator g h = g h g⁻¹ h⁻¹`, `conjugate g h = g h g⁻¹`); the correct cyclic form `commutator (commutator a b) (conjugate b c) * commutator (commutator b c) (conjugate c a) * commutator (commutator c a) (conjugate a b) = ide` is a one-line `equation.group`. For *conditional* identities, where a free-group check does not apply, sampling in `S6` is the cheap second opinion.
     - **Name a flipped hypothesis rather than inlining it.** `comm_sym {g h} (p : commutator g h = ide) : commutator h g = ide => equation.group {pmap inverse p}` is used three times in one 60-line diff.
 
+21. **A `C.member` call whose receiver is a *computed* value needs the instance pinned, and the diagnostic names neither the instance nor the call.** `\this` of a `C.member` application is an ordinary metavariable, not an instance-search goal, so when the intended receiver is a `\func` result (`normalClosure R`, `KernelGroup f`) rather than a declared `\instance`, nothing solves it. Instead of "instance could not be inferred" you get two or three `Cannot solve equation` lines whose two sides are unrelated fragments, then a `Type mismatch` that prints the *argument's* type where an *element* belongs:
+
+        [ERROR] Cannot solve equation
+          1st expression: \Set0
+          2nd expression: E
+          In: quotHom_=1
+        [ERROR] Cannot solve equation
+          1st expression: TruncP
+          2nd expression: contains
+          In: quotHom_=1
+        [ERROR] Type mismatch
+          Expected type: in~ {w} w = ide
+            Actual type: in~ {\Sigma (n : Nat) (contains w)} (\Sigma (n : Nat) (contains w)) = ide
+
+    The fix is one implicit: `NormalSubGroup.quotHom_=1 {normalClosure R} (…)`. **Read `\Set0` vs `E`, or `TruncP` vs `contains`, as "the receiver is unsolved"** — those pairs are a class's field types escaping into unification, not a real type error. Verified 2026-09-14 on `Algebra/Group/Presentation.ard`; the same shape appears for `quot-univ` and `quotHom-eq`. Contrast **arend-quirks** §4's numeral note, where the receiver *is* an instance-search goal and the compiler does say `Cannot infer an instance of class 'Pointed' …`.
+
+22. **A `Comp G F` makes an implicit ambiguous, Arend picks the wrong reading, and the error names two index categories instead.** When a lemma's implicit `{H : Functor J SetCat}` and `{j : J}` have to be read off an element `a : G (F j)`, two solutions unify: `H := Comp G F, j := j` (intended) and `H := G, j := F j`. Arend commits to the second, and the report is a pair of `Cannot solve equation` lines naming the two *categories* plus a mismatch that prints `G.Func` where `(Comp G F).Func` belongs:
+
+        [ERROR] Cannot solve equation
+          1st expression: K
+          2nd expression: J
+          In: inC-eq
+        [ERROR] Type mismatch
+          Expected type: G.Func {j} {j4} (z J.∘ x J.∘ u1) ?a = ?a'
+            Actual type: Func {j} {j4} (z J.∘ x J.∘ u1) a = Func {j'} {j4} (z J.∘ y J.∘ u2) a'
+
+    The tell is `?a`/`?a'` still unsolved next to a *solved-looking* `G.Func`: the functor was guessed before the element. Pinning the whole implicit prefix fixes it — `SetColimit.inC-eq {J} {Comp G F} {j} {j'} {j4} {a} {a'} f g eq`. An ascribed `\have`/`\let` on the equality argument alone is *not* enough (the ascription pins the argument's type, not the lemma's `{H}`), which is the one case where the load-bearing-ascription trick under *Workflow and language gotchas* does not apply. Verified 2026-09-15 on `Category/Cofinal.ard`; expect it wherever `Comp` of `Yoneda`/`const`/diagram functors meets a lemma about `SetColimit`.
+
+23. **A missing `\import Relation.Equivalence` makes `ext` report `\Pi (i : I) -> ?A i`.** `in~`
+    is `Quotient`'s constructor and lives in `Relation.Equivalence` — not in `Logic`, not in
+    `Set.SetCategory`, and not pulled in by importing the module that defines the quotient you are
+    matching on. Without it, `ext \case \elim __ \with { | in~ _ => idp }` over a `SetColimit`
+    gives two errors:
+
+        [ERROR] Cannot find a reference to constructor among provided patterns
+          In: in~ _
+        [ERROR] Type mismatch
+          Expected type: \Pi (i : I) -> ?A i
+            Actual type: \Pi (s : SetColimit …) -> … = …
+
+    The second is the loud one, and it is a lie: `ext` *did* know the goal (checking with `{?}` in
+    place of the `\case` shows the funext goal), but its argument failed to elaborate, so it fell
+    back to `path` with an unknown family. Symptoms that this is the missing import rather than an
+    inference problem: the printed *actual* type is exactly the funext statement you intended, and
+    `ext \lam x => {?}` alone typechecks. Do not spend rounds on `later $`, type ascriptions or
+    `\have`-binding the other argument (all three were tried; none is the issue). Verified
+    2026-09-17.
+
+24. **`cong` can exhaust the JVM stack rather than fail.** On a goal whose sides are large
+    (`f * g = f' * g'` in a group of generalized elements of a pro-object), `cong` — with the
+    component paths supplied via `using (…)` — dies in
+    `org.arend.lib.meta.closure.CongruenceClosure.varHashCode` with a `StackOverflowError`, and
+    the module reports nothing else. Replace it with an explicit `pmap2 ((*) {inst}) p q`.
+    Two notes on that replacement: the instance must be pinned when the carrier's `Monoid` is a
+    `\func` result (`homGroup …` is not an `\instance`, so search finds nothing), and the operator
+    needs parentheses — `Monoid.* {inst} f g` parses as a right *section* and reports
+    `Expression is applied to an argument, but does not have a function type / Argument: g / In: f`,
+    naming the operands instead of the operator. Verified 2026-09-17.
+
 ### Workflow and language gotchas
+
+- **A `Termination check failed` on an obviously-decreasing recursion is usually fallout from an
+  unresolved reference four lines up.** An unresolved name in a recursive lemma's *result type*
+  leaves the recursive call's decreasing argument an unsolved metavariable, so the checker cannot
+  see the descent and reports the lemma as non-terminating — and because the termination pass runs
+  last, that bogus error is the one at the bottom of the output, right where you are looking:
+
+      [ERROR] Algebra.Monoid.SubMonoid:114:71: Cannot resolve reference '*n'
+      [ERROR] Algebra.Monoid.SubMonoid:116:16: Cannot infer parameter 'x' of definition 'contains_+'
+      [ERROR] Algebra.Monoid.SubMonoid:116:28: Cannot infer parameter 'n' of definition 'contains_*n'
+      [ERROR] Algebra.Monoid.SubMonoid:114:10: Termination check failed
+
+  Only the first line is real (here: a class `\func` member needs qualifying — **arend-quirks** §4).
+  Reordering parameters or hoisting a helper to "fix the recursion" achieves nothing. Verified
+  2026-09-14; general instance of *Chasing type errors while unresolved references remain*.
 
 - **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
 
 - **`rewrite p` beats `transport (\lam x => x.<field> ...) p`.** The lambda-projection form fails on records with `Expected type: a class`. `rewrite` rewrites the goal directly without the lambda.
+
+- **A single-use `\have` whose *ascription* solves a lemma's implicits must not be inlined.** The
+  compaction list below says to inline single-use `\have` clauses; this is the exception, and it is
+  the mirror image of the usual hazard (**arend-quirks** §7, where a `\have` makes its value opaque).
+  In `Algebra/Ring/Excision.ard:interMod_pow`,
+
+  ```arend
+  \have b'=ha : b' = h * a => A.regulars-cancel (A.regulars.contains_pow hr) (inv q' *> q *> equation.cRing)
+  \in \let | (inP (b'',Bb'',q'')) => p b' Bb' a (b'=ha *> equation.cRing) \in …
+  ```
+
+  the ascription `b' = h * a` is the only thing that pins `regulars-cancel`'s `{x}` and `{y}`. Inline
+  it into its one use and both come back unsolved, as two `Cannot solve equation` lines naming the
+  *cancelled* factor rather than the missing implicit:
+
+      Cannot solve equation
+        Equation: v0 * h * a = v0 * v0
+        where v0 = pow {A} h k
+
+  Read `v0` appearing on both sides of a product as "an implicit defaulted to the wrong atom", and
+  restore the ascribed binding. Rule of thumb: a `\have` may be inlined when it only *carries* a
+  proof; keep it when its written type is the only statement of what the proof is about.
 
 - **Inference failures want explicit pinning.** For `BigSum_<=` specifically, pass the length plus both arrays: `BigSum_<= {suc n} {arr1} {arr2} (\lam k => ...)`. More generally, when a lemma call gives `Cannot infer parameter X`, annotating one or two implicits is usually enough.
 
@@ -449,7 +556,7 @@ Use `equation` when step proofs are uninteresting. Use `==<` / `>==` / `qed` whe
 
 Existing arend-lib calls (`Algebra/Ring/Localization.ard`, `Algebra/Linear/Matrix.ard`) already pick the correct variant — but `equation` alone is the wrong default for ordered-field arithmetic and the failure message doesn't directly suggest the fix.
 
-**`equation.group` decides group identities, and `{...}` is how you feed it a hypothesis — but the entries are *chain steps*, not assumptions.** The group solver closes any identity that is a word equation in the free group: all eight unconditional `commutator`/`conjugate` identities in `Algebra/Group.ard` (including the full Hall–Witt identity) are a one-line `equation.group`. For a *conditional* identity, `{...}` takes a list of **chain step proofs** — each must bridge two consecutive chain terms, and the solver normalises the gaps shut. With no explicit intermediate terms there is one chain position, so a lone entry must bridge the whole goal. The consequence in practice: **`pmap` the hypothesis into a whole-side bridge and hand that over.**
+**`equation.group` decides group identities, and `{...}` is how you feed it a hypothesis — but the entries are *chain steps*, not assumptions.** The group solver closes any identity that is a word equation in the free group — the full Hall–Witt identity included. **That is also a reason not to state such an identity as a lemma at all:** `Algebra/Group.ard` briefly carried eight unconditional `commutator`/`conjugate` identities and they were deleted again on 2026-09-14, since `equation.group` at the call site is shorter than the name of the lemma proving it. Keep the *conditional* ones, where the bridge below is the content. For a *conditional* identity, `{...}` takes a list of **chain step proofs** — each must bridge two consecutive chain terms, and the solver normalises the gaps shut. With no explicit intermediate terms there is one chain position, so a lone entry must bridge the whole goal. The consequence in practice: **`pmap` the hypothesis into a whole-side bridge and hand that over.**
 
 ```arend
 -- p : commutator g h = ide
@@ -734,7 +841,7 @@ Apply these while writing, not only on a post-pass:
 
 - **Abstract a repeated compound constant into a parameter of the helper, not a `\have`.** When a bound like `coefMax {C} (p - monomial 1 (suc m)) (suc m)` appears five times inside one proof, `linarith`/`equation.cRing` treat it as an opaque blob and every line grows by 50 characters. Give the helper lemma `{C : Real} (C>=0 : 0 <= C) (hC : \Pi k -> … <= C)` and pass the concrete bound once at the call site: inside the helper `C` is a genuine variable, so the solvers see through it. A `\have C => <blob>` does *not* work here — the binding is opaque to implicit-argument inference (arend-quirks §7); bind the *proof* (`\have C>=0 => coefMax>=0 {…} {…} {…}`) instead and let `?C` be read off its type.
 - **Delete** idp-bodied lemmas and `pmap f idp` steps — they carry no content.
-- **Inline** single-use helpers and single-use `\have` clauses.
+- **Inline** single-use helpers and single-use `\have` clauses — *unless* the `\have`'s type ascription is what solves a downstream lemma's implicits (see the load-bearing-`\have` entry under *Workflow and language gotchas*).
 - **Replace** hand-stepped `\have` chains with `simplify` / `equation.cRing` / `linarith` where one of them closes the goal outright.
 - **Flatten** with slot notation (`` `<∘ b ``, `__ + 1`) and `$` instead of nested parens.
 - **Migrate** helpers used by exactly one parent into that parent's `\where`.

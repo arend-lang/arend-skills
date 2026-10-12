@@ -125,11 +125,108 @@ What Arend does (`tutorial/PartI/records.md`, `language-reference/definitions/re
 - **Definitional eta** for records/classes: `\new R { | f => r.f | g => r.g }` is definitionally equal to `r`. Data types don't get this unless you opt in.
 - **Classifying field**: the first explicit parameter of a `\class` is the classifying field (can mark others with `\classifying`, or disable with `\noclassifying`). An instance coerces automatically to this field's value. So `s : Semigroup` used where a `\Set` is expected becomes `s.E`; `m : Monoid Nat` used where a `Nat` expression is expected applies `m`'s operation only if the carrier field coerces to a function — more commonly this is what lets `Monoid Nat` match instance searches for `Nat`-carried structures.
 - **Instance search**: implicit parameters typed by a class get filled by searching declared `\instance`s whose classifying field matches. No goal-directed unification cascade like Coq canonical structures — it's first-match-on-classifier.
+- **A second `\instance` whose classifying expression has the *same shape* as an existing one
+  breaks instance search in unrelated modules, and the diagnostic names your new instance.**
+  Declaring `\instance FunctorCartesianPrecat (J : Precat) (C : CartesianPrecat) : CartesianPrecat
+  (Functor J C)` alongside the library's existing `FunctorPrecat` / `FunctorCat` (both classified
+  by `Functor J C`) made every later `Precat` search over a functor category ambiguous — the first
+  failure surfaced in `Category/Ind.ard`, a module that mentions no functor category, as
+
+      [ERROR] Cannot infer an instance of class 'Precat'
+        Candidate is: FunctorCartesianPrecat ?J ?C
+        Since types of the candidates are not less than or equal to the expected type
+
+  Rigidity (previous bullet) is necessary, not sufficient: ask also whether the classifier is
+  *already taken*. When it is, declare a **`\func … \cowith`** and pass it explicitly. Same call
+  for `IndPrecat` / `ProPrecat` (`Ob = \Sigma (P : Presheaf C) (IsIndObject P)` is rigid, but the
+  two would classify identically and differ only in `Hom`). Verified 2026-09-15.
+- **Consequence: composition in a `\func`-defined category needs the instance *and all three
+  object implicits* pinned.** `const.Func g ∘ ofLevel f` for `ProPrecat C` a `\func` does not
+  merely fail to find the instance — the operands' types reduce to homs of a category that *is*
+  an instance (here `PresheafCat`), so search silently picks that one and composes in the
+  **opposite** order. Write `Precat.o {ProPrecat C} {A} {B} {D} g f`; with only `{ProPrecat C}`
+  pinned you get `Cannot infer parameter 'X' / 'Y' / 'Z' of definition 'o'`.
+- **An index-category parameter declared as bare `Precat` drags bare `Hom` to the infinite level.**
+  In `\func homDiagram.{u} {C : Precat.{u,u}} {J : Precat} (c : C) (D : Functor J C) : Functor J
+  SetCat.{u}`, the clause `| F j => Hom c (D j)` is rejected with `Expected type: \Set u / Actual
+  type: \Set`, plus a spray of `Cannot infer parameter 'X' of definition 'o'`: bare `Hom`
+  resolved its instance to `J`, not `C`. Two fixes, apply both — give every index category finite
+  levels (`{J : Precat.{u,u}}`) and qualify the operations you mean (`C.Hom`, `C.∘`, `C.id-left`,
+  `C.o-assoc`), which is what `HomLeft` in `Category/Yoneda.ard` already does. Verified
+  2026-09-15.
+- **`SubSet`'s classifying field is `contains`, so an implicit `{R : SubSet X}` is instance-searched.**
+  `\class SubSet (S : BaseSet) (\classifying contains : S -> \Prop)` (arend-lib `Set/SubSet.ard`). A
+  `\where` member that inherits `{R : SubSet (FreeGroup S)}` from its parent `\func` — e.g.
+  `PresentedGroup.rel` — gets it by instance search on the argument's predicate, not by
+  unification, and fails with `Cannot infer an instance of class 'SubSet' with classifying
+  expression: StRel …` plus a bogus `Cannot infer parameter …` on the constructor passed in. Pin
+  it: `PresentedGroup.rel {Gen I R} {relSet Phi R} (r1 …)`. Verified 2026-10-12. Relatedly,
+  `S ⊆ T` binds its point *implicitly* (`normalClosure.superset R r`, not `… R w r`), and a
+  function `h : \Pi (w) -> R w -> …` is passed as `\lam {w} => h w`: Arend does not
+  eta-insert the implicit binder, so `(h _)` fails.
+- **An `\instance`'s classifying expression must be *rigid*: a universe, a sigma type, a record, or a partially applied data/constructor.** A field access does not qualify, so `\instance DirectedFiltered (J : DirectedSet) : FilteredPrecat J` is rejected with `Classifying field must be either a universe, a sigma type, a record, or a partially applied data or constructor` — `J` elaborates to `J.E`. Same for `| Ob => S.Total` (a `\func` result). The message lists the admissible shapes but never says which subterm failed or what to do; the fix is to declare a **`\func … : C \cowith`** instead, which costs nothing when the value is always passed explicitly (index categories, carrier wrappers). Contrast the cases that *are* accepted: `FunctorPrecat (C D : Precat) : Precat (Functor C D)` (a record), `SetCat : Cat (\Set u)` (a universe), `ProductDirectedSet (X Y : DirectedSet) : DirectedSet (\Sigma X Y)` (a sigma — note the sigma is rigid even though its *components* are field accesses). Verified 2026-09-15 on `Category/Filtered.ard`.
 - `\this` is an implicit parameter of type `R` available inside every field/function of record `R`. Usable only in argument positions.
 - `\cowith` gives copattern-style definition: `\func zeros : Pair Nat Nat \cowith | fst => 0 | snd => 0`. Equivalent to `\new`, but can be the body of a `\func`.
 - **Properties**: `\property p : P` requires `P` to be a proposition. Fields whose type is provably in `\Prop` are auto-promoted to properties unless marked `\field`. Properties don't compute — important for proof UX and performance.
 - **Diamond handling**: `\extends A, B` where both extend `C` deduplicates `C`'s fields. But if `A` and `B` each independently define a field with the same name, you get two distinct fields and need qualified access `A.f {r}` vs `B.f {r}`. The algebraic-hierarchy advice is: avoid `\extends AbGroup, Monoid` for rings — use `\extends AbGroup { | mulMonoid : Monoid A }` to keep `*` and `+` in separate fields.
+- **A class's `\func` / `\lemma` members do not resolve bare from a subclass body — only its
+  *fields* do.** Inside `\class SubAddMonoid \extends SubAddPointed` (`\override S : AddMonoid`),
+  `contains_+ … : contains (x + y)` resolves `+` without help, because `+` is a *field* of
+  `AddMonoid` and the field is reachable through `S`. A `\func` member is not: `contains (n *n x)`
+  fails with `Cannot resolve reference '*n'`, and has to be written `contains (n AddMonoid.*n x)`.
+  The neighbouring library code already does this everywhere once you look — `contains_BigSum`
+  writes `AddMonoid.BigSum l`, `SubMonoid.contains_pow` writes `Monoid.pow x n` — so **copy the
+  qualification style of the definition next door rather than the operator style of the field
+  above it**. Qualified infix parses fine (`n AddMonoid.*n x`, and `x Arith.Int.IntRing.+ y` at
+  `Algebra/Group.ard:263`). Verified 2026-09-14. See **arend-prove** for the bogus
+  `Termination check failed` this produces inside a recursive lemma.
+
+  **It is not only subclass bodies: a class `\func` member does not resolve bare from *anywhere*,
+  even with the instance a parameter in scope.** For `{R : PseudoCRing} (a b : R)`, the integer
+  multiple `n *i (a * b)` — `*i` being `\func \infixl 7 *i` inside `\class AddGroup` — is
+  rejected with a plain `Cannot resolve reference '*i'`, although `*`, `+` and `negative` in the
+  same expression resolve fine, because those are *fields*. Write `n R.*i (a * b)` (instance
+  qualification, the Phase-4 style) or `n AddGroup.*i (a * b)`; both typecheck. Verified
+  2026-09-18.
+
+- **A numeral on one side of a comparison pins the instance before the variable does.** For
+  `d : Int`, the natural-looking `0 <= d` is rejected with
+  `Cannot solve equation: 1st expression: Nat, 2nd expression: E` — the literal `0` resolves at
+  `Nat` and `<=` is then searched for a `Nat`-carried `Preorder`, with `d`'s type never getting a
+  say. Pin the operator, not the numeral: `0 IntRing.<= d` (the idiom at `Arith/Rat.ard:327`,
+  `Arith/Int.ard:279,283`). Verified 2026-09-14 on `Algebra/Ring/GradedCoeffs.ard`.
+
+- **A numeric literal needs a *declared* instance, so `1` fails over a `\func`-computed group.** Instance search matches the classifying field against `\instance` declarations only. `NormalSubGroup.Quot` and `PresentedGroup S R` (`Algebra/Group/Presentation.ard`) are `\func`s returning a `Group`, so `quotHom x = 1` is rejected with `Cannot infer an instance of class 'Pointed' with classifying expression: Quotient {E {S}} (~)` — write `ide {Quot}` / `ide {PresentedGroup S R}`. The same statement with the group a *variable* (`\Pi (w : …) -> R w -> f w = 1` for `{G : Group}`, `f : GroupHom _ G`) needs no annotation, because the parameter pins the instance. Verified 2026-09-14.
+
 - **Arithmetic on a *concrete* record instance computes, and that breaks term-level tooling.** `ComplexField.*` is implemented by a formula on `re`/`im`, so `x * y` normalizes to `\new Complex (x.re * y.re - x.im * y.im) (…)`. Note the body has no pattern matching, so this reduction is **unconditional** — it fires for two *variable* operands too, not only when one is concrete. Verified 2026-08-11: `rewrite cabs_* idp` fails on `cabs (h * h * q) = cabs h * cabs h * cabs q` for `h q : Complex` parameters, because after normalization the goal contains no `*`-application for the pattern to match. The pretty-printer re-folds the record literal, so the error displays an expression that visibly contains the pattern it reports as missing — see **arend-prove** failure mode 18. Consequences (all verified 2026-07-29, on what is now `Arith/Complex/FTA/Kneser.ard`): `equation.cRing` cannot prove even `x * y = y * x` at `Complex`; `rewrite` cannot match a pattern containing a meta under a `*`/`+`; and unification cannot infer an implicit that occurs only under one. **Keep such algebra symbolic: state the step over an abstract `{C : CRing}` (or make the operands explicit parameters of a helper) and instantiate.** Abstract class parameters are what keep a term neutral — this is a general reason a helper lemma over `{M : AbMonoid}` succeeds where the same proof inlined at the concrete instance fails. See **arend-prove** failure modes 15–17 for the diagnostics.
+
+- **In `SetCat` the composition `∘` *reduces*, so the `pmap (∘ _)` / `inv o-assoc` proof style
+  breaks.** `SetCat`'s `o g f => \lam x => g (f x)` has no pattern matching, so a composite of two
+  *variable* morphisms normalizes to a lambda and `id-left`, `id-right`, `o-assoc` are all literally
+  `idp`. Consequences, all hit on 2026-09-17 while proving that limits of presheaves are pointwise:
+  `pmap (∘ _)` cannot solve its `_` (the goal contains no `∘`-application to match), supplying the
+  argument by hand does not help because the *other* side has eta-expanded to `\lam x => …`, and
+  `inv o-assoc` reports `Cannot infer parameter 'g'` since its implicits are only recoverable from a
+  neutral composite. The diagnostic prints the goal in pointwise form (`trans {L.coneMap j} Y (… x)
+  = coneMap j ∘ ?_x`), which reads as a unification bug rather than a reduction problem.
+  **Fix: state the lemma over an abstract target category** (`{D : Cat}` instead of `SetCat.{u}`) and
+  instantiate. Same medicine as §4's "keep such algebra symbolic", same cause — a concrete instance
+  whose operation is implemented by a formula is never neutral. Here it also *weakened* the
+  hypothesis, since nothing about sets was used.
+
+- **`\have x : T => \new R { | Parent => v | … }` leaves `x`'s non-parameter fields opaque, even
+  when `T` pins the classifying field.** With `\have M : Limit (Comp G F) (G L.apex) => \new Limit {
+  | Cone => Cone.map G L | isLimit => p }`, the ascription makes `M.apex` reduce (it is a parameter
+  pinned by `T`), but `M.coneMap j` does **not** reduce to `G.Func (L.coneMap j)` — `coneMap` is an
+  ordinary field, and the goal comes back mentioning an irreducible `M.coneMap j`. Dropping the
+  ascription is not enough either; what is needed is that the receiver be a *reducing* term.
+  **Fix: put the packaging in a `\func`** — `\func fromIsLimit (c : Cone G) (cl : IsLimitCone c) :
+  Limit G c.apex \cowith | Cone => c | isLimit => cl` — and write `fromIsLimit c cl` at each use
+  site. A `\func` application unfolds, so `(fromIsLimit c cl).coneMap j` reduces to `c.coneMap j`.
+  Inlining the `\new` at every use site works too, and is what arend-lib does
+  (`\new Limit { | Cone => c | isLimit => cl }` appears verbatim in `Category/Limit/Finite.ard` and
+  `Set/SetCategory.ard`). Refines §7: the opacity is not only about unification of the bound
+  *value*, it also blocks field projection through an implemented parent.
 
 ## 5. Universes, levels, and `\Prop`
 
@@ -191,6 +288,30 @@ The rule that follows: **never bind a value that a downstream lemma has to patte
 
 The same fix applies to `\Sigma`-returning helpers: building a tuple whose components each need an implicit inferred from a `cabs`/`pow` application tends to fail where two separate lemmas with explicit implicits succeed.
 
+**Level metavariables defeat the comparison fast path, so transparent `\func`s unfold — the usual
+cause of a multi-second definition with a tiny body.** A call to a level-polymorphic definition
+without `.{…}` instantiates its levels with metavariables, solved only at the end of the
+*enclosing* definition. Checking an argument of type `P.{u} a b` against a parameter of type
+`P.{?u} a b` then cannot succeed argument by argument, and when `P` is a `\func` Arend unfolds both
+sides and compares normal forms, although the two terms are otherwise syntactically identical.
+Measured 2026-10-12 in the thesis repo (`Algebra/Ring/ProRingPresentation.ard`), passing
+`hb : IsBalanced S (grpObj-ofDiagram GD) g` to a lemma taking exactly that type: 7.6s as written;
+0.2s as `lemma.{u} …`; 1.3s with `IsBalanced` a `\type`; 0.2s with `IsBalanced` a `\type` *and*
+`grpObj-ofDiagram` an `\sfunc`. The remedies, which took that library from 3m28s to 1m29s:
+- Prop-valued notations (`IsBalanced`, `IsAdditive`): `\type`. Projections (`hb.4`), tuple
+  construction and `transport` motives keep working. A `\type` is coerced only at the top of an
+  expected type: `TruncP (\Sigma …)` against `TruncP (LevelSol …)` is a mismatch, so keep it
+  out of positions under `TruncP` or a `\Pi`.
+- Constructed structures (wrappers around `mapGroupObject …`): `\sfunc`, with the carrier pinned
+  in the result type (`: GroupObject {D} (ofDiagram Gd)`) so that `.E` still computes. The few
+  proofs that need the body bridge with `rewrite (\peval f x) proof`, or `{\eval f x}` in an
+  implicit slot.
+- Where unfolding is unavoidable, pin `.{o,u}` at the hot call sites (a 6.8s lemma became 3.0s).
+- A `\func` of propositional type whose value nobody unfolds becomes a `\lemma` (Arend's
+  `Function can be declared as a lemma` warning flags these).
+
+Find hot spots with `arend --no-daemon -r --show-times [MODULE[:DEF]]` (see **arend-formalize**).
+
 ## 8. Pattern-matching data types with varying constructors
 
 Not something Coq can express directly (`tutorial/PartI/datanproofs.md`, `language-reference/definitions/data.md`):
@@ -227,6 +348,28 @@ Strict positivity is enforced: the type cannot occur in a function-domain positi
 - A class's classifying field gives an automatic coercion to that field's type.
 - Coercion into a function type partially applies.
 - Because coercions fire silently, if typechecking reports a surprising type, check for an inserted coercion before blaming unification.
+- **Never put `\coerce` on the payload field of a *wrapper* record that carries its own algebraic
+  structure.** The coercion fires **in preference to instance search on the wrapper**, so the
+  wrapper's operations become unreachable in infix notation. With
+  `\record Homotope {R : CRing} (s : R) (\coerce val : R)` and `\instance HomotopeRing (s : R) :
+  PseudoCRing (Homotope s)` implementing `* a b => \new Homotope s (a.val * s * b.val)`, the
+  expression `a * b` for `a b : Homotope s` silently means the product **in `R`** — the tag `s`
+  drops out, which is the one thing the wrapper existed to prevent. You cannot even state the
+  intended law: `(a + b).val = a.val + b.val` is rejected with
+
+      Type mismatch
+        Expected type: a class
+          Actual type: R.E
+        In: a + b
+
+  because `a` and `b` were coerced out of the record before `+` was resolved, so `.val` is being
+  applied to an `R`-element. Verified 2026-09-14 on `Algebra/Ring/Homotope.ard`; dropping
+  `\coerce` fixed both, and `.val` is short enough that nothing was lost. Note the asymmetry:
+  operations that exist *only* on the wrapper are unaffected — `(r *c a).val` typechecks fine,
+  because no coercion path makes `r *c a` an `R`-element. So the symptom appears exactly on the
+  operations the wrapper *shares* with its payload type (`+`, `*`, `zro`), which are the ones
+  you care about. Keep `\coerce` for genuine one-way embeddings (§10's `Real -> Complex`), not
+  for a field you will also do arithmetic over.
 - **Hoist explicit embeddings to `\use \coerce` when you'd otherwise repeat them.** If a `.ard` file inserts `fromReal x` / `wrap x` / `inj x` at every call site, define `\use \coerce fromReal (x : Real) : Complex => …` once inside the target record's `\where`, and the elaborator silently inserts it everywhere. The 2026-05-15 refactor moved the `Real → Complex` embedding to a `\use \coerce` inside `Complex \where`; downstream `I * fromReal x` instances throughout `Arith/Trig/Real.ard`, `Arith/Trig/Complex.ard`, `Arith/Complex/Euler.ard`, and `Arith/Complex/Norm.ard` collapsed to `i * x`. The coercion is at `Arith/Complex.ard:23`; the accompanying `\open Complex \using (iunit \as i)` appears at the top of each of those files.
 
 ## 11. Implicit arguments, `\meta`, and the tactic story
@@ -237,6 +380,57 @@ Strict positivity is enforced: the type cannot occur in a function-domain positi
 - `_` in an argument = infer; `_` as a parameter name = "don't care" (repeatable).
 - Inference *across constructor-injectivity* works: `{n m : Nat} (p : suc n = m)` → both can be inferred. `{n : Nat} (p : n + n = 3)` → cannot, since `+` is not a constructor.
 - Goals: `{?}` is a hole.
+- **An implicit that vanishes when the definition reduces can never be inferred — declare it explicit.**
+  A `\func`-defined proposition is unfolded before its arguments are solved, so a parameter that the
+  body's own reduction *erases* is unrecoverable from the expected type. `\func SurjMod {A : CRing}
+  (B : SubRing A) (h : A) (k : Nat) : \Prop => \Pi (a : A) -> ∃ (a' b : A) (B b) (a = pow h k * a' + b)`
+  looks like it determines `h` — but at `k = 0`, `pow h 0` reduces to `ide` and `h` is gone, so
+  `\lemma surjMod_zro {h : A} : SurjMod B h 0` fails at every call site with `Cannot infer parameter
+  'h' of definition 'surjMod_zro'`. `B` stays inferable, `h` does not. Write `(h : A)`. The tell is
+  that the failing parameter is one the *reduced* goal never mentions — check by hand which arguments
+  survive the definition's `\elim` before choosing the implicit/explicit split. Verified 2026-09-14 on
+  `Algebra/Ring/Excision.ard`.
+
+- **A lemma whose implicits come *before* its explicit arguments cannot be passed point-free.**
+  `nonZero-left {x y : E} (x/=0 : x /= zro) (x*y=0 : x * y = zro) : y = zro` (`Algebra/Domain.ard:48`) looks like it
+  should fill a `\Pi {x : E} -> r * x = zro -> x = zro` slot once its first argument is given, but `nonZero-left r/=0`
+  solves `{y}` as a *metavariable* rather than leaving it to be bound later:
+
+      Expected type: r /= zro -> \Pi {x : E} -> r * x = zro -> x = zro
+        Actual type: r /= zro -> r * ?y = zro -> ?y = zro
+
+  Write the binder out — `\lam r/=0 p => nonZero-left r/=0 p`. Arend inserts the implicit `\lam {x}` for you *there*,
+  because the expected type is known at the lambda; it will not eta-expand a term that has already been applied.
+  Verified 2026-09-14 on `IntegralDomain.regulars-char`. Same symptom class as the `Fin`/`Nat`-coercion eta-lambda note
+  in **arend-prove**'s compaction list, different cause: not every `\lam x => f x` is removable.
+- **An implicit that occurs only as `?J.op` (or under any other `\func`) is unsolvable, and the
+  diagnostic blames instance search.** A signature like `\func prodDiagram {C : PrecatWithBprod}
+  {J : Precat} (X Y : Functor J.op C)` determines `J` only by inverting `Precat.op`, which Arend
+  will not do. At a call site where nothing else mentions `J`, the report is not "cannot infer J"
+  but
+
+      [ERROR] Cannot infer an instance of class 'Precat'
+        Candidate is: PrecategoryOfElements.{?p1, ?p2, ?p3} {{?error}} ?P
+
+  followed by half a screen of that candidate's field implementations. Pin the argument
+  (`prodDiagram {C} {FilteredProduct A.2 B.2} X Y`). Rule of thumb: **whenever a parameter's type
+  mentions the implicit only under a `\func` application, the implicit is not inferable** — either
+  pin it at every call site or make it explicit. Verified 2026-09-17 across `Category/Pro/Limit.ard`.
+- **Unification against a `\func`-defined construction picks a wrong solution instead of failing.**
+  `proPair u v`, `ofDiagram X`, `toLevel X j`, `mapOfDiagram a` all unfold (to Yoneda transforms,
+  Σ-tuples, quotient maps), so matching `proPair ?u ?v` or `mapOfDiagram {?X} {?Y} a` against a goal
+  is higher-order; Arend commits to the first solution it can build, which is often the source
+  where the target belongs (`?Y := X` for `mapOfDiagram`), and the mismatch then surfaces one chain
+  step later with two printed types differing in a single subterm. Three habits that follow, all
+  paid for in debugging rounds on 2026-09-17:
+  * state such a lemma with the components **explicit** — `proPair.o (a b : …) (u v : …)`, not
+    implicit, when the conclusion mentions `proPair u v`;
+  * pin the *target* of a map-like construction (`mapOfDiagram {C} {J} {X} {V} a`, and give
+    `toLevelOf.map` its target diagram as an explicit parameter);
+  * pin a test object that is a compound term: `proPair {C} {ofDiagram X} u v`, because solving
+    `?W.1.F ≡ indFunctor …` is a projection applied to a metavariable and is not solvable at all
+    (the error is then `Cannot solve equation: NatTrans … (F {?W.1})` plus `Cannot infer parameter
+    'W'`).
 - **No tactic language in the core.** "Tactics" are `\meta`s — macros that expand into Arend expressions, type-checked post-expansion. Defined either in Arend (`\meta f x => e`, pure substitution) or in Java (the interesting ones, shipping as the standard library's `Meta` modules).
 
 For the catalog of metas (`rewrite`, `ext`, `simplify`, `equation`, `cong`, `linarith`, `cases`, `mcases`, `unfold`, `assumption`, `in`, `at`, `run`, `$`, `#`, `repeat`, `using`, `defaultImpl`, …), their semantics, common failure modes, and a decision table, see the **arend-prove** skill.
@@ -256,12 +450,47 @@ For the catalog of metas (`rewrite`, `ext`, `simplify`, `equation`, `cong`, `lin
 
   Everything after a leading operator is its *right operand*, so `(+ suc 1) 5` is `\lam x => x + suc 1` applied to `5`. Passing an implicit does not opt out: `+ {r} 0 1` errors while `(+ {r} f 3) 4` is a section and typechecks. Ordinary (non-`\infix`) functions are unaffected — `(f 5) 2` is fine — and field operators section identically: `r.+ 1` ≡ `\lam x => x r.+ 1`.
 
+  **A *qualified* field operator behaves the same, and the message names the operands.**
+  `Monoid.* {homGroup {C} (X j) G} f g` — an attempt to multiply with the instance pinned, since
+  `homGroup` is a `\func` and instance search will not find it — parses as the section
+  `\lam x => x Monoid.* …` and reports `Expression is applied to an argument, but does not have a
+  function type / Argument: g / In: f`. Write `(*) {homGroup {C} (X j) G} f g`. Verified 2026-09-17.
+
   Practical consequence: **an infix operator passed as an argument always needs its parens.** `pmap2 (+) p q`, `\new AddGroup G.E G.ide (G.*) …`, `Big (∨) (l 0) (tail l)`. Dropping them is the compaction regression catalogued in **arend-error-type-mismatch** (*Stripped parentheses around an infix operator*); depending on whether operands surround the operator you get either that entry's bogus `Type mismatch` / `Expected type: I`, or — when the operator leads — `Expression is applied to an argument, but does not have a function type`.
 - **A backticked reference with no operands is rejected outright.** `` \func test => Nat.`div` `` gives `Infix notation is not allowed here`, and `` Nat.`div `` gives `Postfix notation is not allowed here` (`base/src/main/java/org/arend/naming/resolving/visitor/ExpressionResolveNameVisitor.java:294` for plain references, `:336` for field calls). `` Test.`pair`.1 `` fails earlier still, at parse. Backticks are fixity *annotations on an application*, not a way to name an operator — to denote the operator itself, parenthesize: `(Nat.div)`.
+- **A `\Pi` / `\Sigma` / `\lam` on the right of an infix operator needs parentheses**, and the
+  parse error names the keyword rather than the operator: `A <-> \Pi (k : Nat) -> P k` is rejected
+  with `no viable alternative at input '\Pi'`. Write `A <-> (\Pi (k : Nat) -> P k)`. Verified
+  2026-09-14; same shape for `->`-chained statements handed to `&&`, `||`, `<->`.
 - Comments: `-- line`, `{- nestable block -}`.
 - `()` pattern — absurd case, RHS omitted. Often nested: `| fsuc (fsuc (fsuc ()))`.
 - `\as x` binds an as-pattern; in `\case`, `\as x \return T[x]` is the dependent idiom.
-- Dot notation: `x.f` works **only** if `x` is a variable whose type is a literal record/class name. For general expressions use `Record.f {x}`.
+- Dot notation: `x.f` needs `x`'s type to be a literal record/class name — but `x` does **not** have to be a
+  *variable*. A parameterless `\func` whose result type is a class works too: with `\func regulars : SubMonoid \this`
+  a member of `\class CRing`, both `regulars.contains_pow p` and the verbose `SubMonoid.contains_pow {regulars} p`
+  typecheck, and `Domain.nonZeroMonoid` reaches into its sibling the same way (`subMonoid.Total`,
+  `Algebra/Domain.ard:58,64`). It **chains**, too: from outside the class, with `A : CRing` a parameter,
+  `A.regulars.contains_pow hr` typechecks — no need for `SubMonoid.contains_pow {A.regulars} hr`
+  (verified 2026-09-14). And a `\func` member of a *record* is reachable on a genuinely applied
+  expression: `(excisionHom B h).Kernel x` needs no pinning, because the receiver's type is a record
+  name, not a class awaiting instance search. Verified 2026-09-14; an earlier revision of this line said "only if `x` is a
+  variable", which pushes you to the verbose form for no reason. For a genuinely *applied* expression
+  (`closure S`, `normalClosure R`) the pinned `Record.f {e}` form is still required — see **arend-prove** failure
+  mode 21 for the diagnostic it gives when you forget.
+  The one case that genuinely needs a type ascription is a binder whose type comes from a
+  **class field** rather than from the expression: implementing `QEquiv`'s `ret` as
+  `| ret a => a.val` fails, because `ret`'s domain is the field `B`, not a record name — even
+  though `B` is already solved and the error prints the solved value, so it reads as
+  self-contradictory:
+
+      Type mismatch
+        Expected type: a class
+          Actual type: Homotope {R} s
+        In: a
+
+  Annotate the binder — `| ret (a : Homotope s) => a.val` — and it goes away. Verified
+  2026-09-14 on `Homotope.embed-equiv`. Binders whose type comes from an *instance's* carrier are
+  fine as-is: `| * a b => \new Homotope s (a.val * s * b.val)` in the same file needs no ascription.
 - `__` (double underscore) — implicit lambda slot, enables sections like `__ + 1`.
 - `\open M`, `\open M (f, g)`, `\open M \hiding (f)`, `\open M (f \as f')`, `\open M \using (f \as f')`. `\import` bundles visibility. **`\open M \using (Long \as short)` is the idiom for aliasing a hot identifier file-locally** — e.g. `\open Complex \using (iunit \as i)` at the top of `Arith/Trig/Real.ard:34` (and `Arith/Complex.ard:19`, `Arith/Trig/ArcTan.ard:49`, `Arith/Trig/Complex.ard:19`, `Arith/Complex/Euler.ard:14`, `Arith/Complex/Norm.ard:38`) lets the body write `i * x` everywhere instead of `Complex.iunit * fromReal x`. Reach for it whenever a long-named constant is used more than ~3 times.
 - `\let` bindings are non-recursive and sequential (each sees the previous).
@@ -395,7 +624,24 @@ Any occurrence of `{-`, `-}`, or `{-}` *inside* a doc comment (i.e. not the comm
 
 When making your record a descendant of another (e.g. `\record RatAnalytic ... \extends CoverMap`) and supplying defaults for the parent's fields, several non-obvious things hold:
 
+- **A record body with no braces cannot hold methods at all, and the diagnostic blames `\this`.**
+  `\record R (I : \Set)` followed by a `|`-field list and then a `\lemma` puts that `\lemma` at
+  *top level*, not in the record: the brace-less form accepts fields only. Every field reference
+  in the stray definition then needs an instance that nothing supplies, and the report is a spray
+  of `Cannot infer parameter 'this' of definition '<field>'` — pointing at the fields, never at
+  the missing brace — plus, for a `\lemma`, a bogus `The type of a lemma must be a proposition /
+  Actual level: \Type0`. Wrap the whole body: `\record R (I : \Set) { | f : … \lemma m => … }`.
+  Verified 2026-09-18 on `src/RootSystem/Basic.ard` in the thesis repo. (Arend's own
+  `\class AddGroup \extends AddMonoid { … }` is the shape to copy.)
+
 - **Field order is strict.** All `|`-fields (including assignments like `| InheritedField => value`) must come *before* any `\func` / `\lemma` methods in the record body. Mixing them yields confusing "field implementation cycle" or "cannot resolve reference" errors that never mention ordering. If you see `Cannot resolve reference 'foo'` for a method `foo` defined *below* in the same record, ordering is the first thing to check.
+
+  The rule also governs *insertions* into an existing class, and there the diagnostic points nowhere near the edit:
+  dropping a `\func` in above `\class Semiring`'s `| natCoef : Nat -> E` (`Algebra/Semiring.ard:38`) reports
+  `Cannot resolve reference 'natCoef'` at `natCoef`'s *users* further down the class, followed by a spray of
+  `Cannot infer parameter` errors in every importing module — which reads like a broken instance hierarchy. Verified
+  2026-09-14. **When an insertion breaks names you never touched, check that you landed below the `|`-block**, and
+  re-check the neighbouring modules only after that.
 
 - **`| InheritedField => value` closes the parent's field.** This is the canonical pattern when extending: the child supplies a default value for what the parent left abstract.
 
@@ -466,6 +712,21 @@ When making your record a descendant of another (e.g. `\record RatAnalytic ... \
   ```
   Same goes for `disk-incl` (replace with the top-level `disk-incl-aux {A} {radius}`).
 
+- **A coclause that binds a field's implicits must bind *all* of them, including the ones its body
+  never mentions.** Implementing `Functor`'s `Func-o {X Y Z : C} {g : Hom Y Z} {f : Hom X Y}` as
+  `| Func-o {D} {D'} {D''} => exts \lam c => … D'' …` is rejected with a bare
+
+      [ERROR] Type mismatch
+        In: exts
+
+  even though only `D''` occurs in the body; so is `| Func-o {_} {_} {D''} => …`. Writing all five,
+  `| Func-o {D} {D'} {D''} {b} {a} => …`, fixes it — the two trailing binders stay unused. The
+  diagnostic names `exts` and nothing else, so it reads as a failure of the proof rather than of
+  the binder list. Same family as the "expected type is not ground" errors in **arend-formalize**:
+  with the tail left unbound those implicits are still metavariables when `exts` elaborates.
+  Verified 2026-09-15 on `Category/Ind.ard`'s `limFunctor` (`Func-id {D}`, with one implicit,
+  needs no such padding — the rule bites only when you bind a *prefix* of several).
+
 These pitfalls compound: a single naïve `| InheritedField => method-defined-later` line can trigger any of forward-reference-failure, implicit-arg-failure, *and* implementation-cycle errors, none of which name the underlying ordering/scoping issue. When debugging a record refactor, audit field-default expressions for: (a) only-fields-and-top-level-functions referenced, (b) all implicit args spelled out, (c) `|`-block ends before the first `\func`/`\lemma`, (d) sibling-class method calls (like `open-char`) are qualified with the receiver instance.
 
 ## 21. Quick decision table when stuck
@@ -483,3 +744,47 @@ These pitfalls compound: a single naïve `| InheritedField => method-defined-lat
 | Need to squash into `\Prop` | `\truncated \data ... : \Prop` |
 | Want definitional equality for a derived def | `\type` instead of `\func` (or leave it as `\func`, which reduces) |
 | Equality / algebra / arithmetic goal | See the **arend-prove** skill |
+
+## 22. Subtyping between records is by *named* ancestors, not by field sets
+
+Learned while splitting `Ideal` into rng-level and unital halves (`Algebra/Ring/Ideal.ard`,
+2026-09-14). Three rules, in the order they bite:
+
+- **A record is a subtype only of the classes it names in `\extends` (transitively).** Having
+  every field of `C` is not enough. `\record TIdeal \extends LIdeal, RIdeal` — where `LIdeal
+  \extends PseudoLIdeal` and `RIdeal \extends PseudoRIdeal` — has literally all of
+  `PseudoTIdeal`'s fields and is still *not* a `PseudoTIdeal`, so it cannot be passed to
+  anything expecting one. Name the ancestor: `\extends PseudoTIdeal, LIdeal, RIdeal`.
+
+- **Naming it then fails if two superclasses `\override` a shared field to different types** —
+  even when the types are comparable (`Ring <: PseudoRing`). Arend does not intersect them:
+
+  ```
+  [ERROR] The types of the field 'S' differ in super classes 'PseudoTIdeal' and 'LIdeal'
+    In: TIdeal
+  ```
+
+  **The fix is to re-`\override` the field in the descendant**, which is checked *after* the
+  superclass list and settles the conflict: `\record TIdeal \extends PseudoTIdeal, LIdeal,
+  RIdeal { \override S : Ring }`. Same for `Ideal \extends PseudoIdeal, TIdeal { \override S :
+  CRing }`.
+
+- **Conflicting *default implementations* inherited from two parents are tolerated** (no error,
+  no warning) — `PseudoLIdeal` deriving `contains_* _ c => ideal-left c` and `PseudoRIdeal`
+  deriving it from `ideal-right` coexist in `PseudoTIdeal`. Only *types* of fields must agree.
+
+A field implementation written after the `\extends` list without braces is rejected with
+`Field 'f' does not belong to class 'C'` — implementations go inside `{ … }` (see §20 on field
+order); `\record C \extends A, B | f => v` is parsed as a *declaration* site.
+
+**Corollary: `\open M (names)` does not re-export — at file level either.** Opening inside a
+definition's `\where` makes the names visible in that definition's own body, but `Parent.name`
+still does not resolve from outside. The same holds for a *file-level* `\open`: `Algebra/Ring/Factor.ard`
+opens `FactorPseudoRing (Type, inF, fequiv, fequiv0, unfequiv, unfequiv0)` at the top, and importers
+still have to write `FactorPseudoRing.fequiv0` or repeat the `\open` themselves — which is what every
+consumer in the tree does (`Algebra/Ring/Integral.ard:167`, `Algebra/Ring/Nakayama.ard:39`,
+`Algebra/Ring/Excision.ard`). Verified 2026-09-14. So when a helper moves out of `M`'s `\where`, an `\open`
+in the old place will not keep the old path alive — update the call sites. The error at those
+call sites names the *parent's* parameters (`Parameter 'I' must be specified explicitly. In:
+FactorRing`), never the missing member, because resolution falls back to field access on the
+value; same read-as-nonsense shape as §18.

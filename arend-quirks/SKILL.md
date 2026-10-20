@@ -197,6 +197,15 @@ What Arend does (`tutorial/PartI/records.md`, `language-reference/definitions/re
   `Arith/Int.ard:279,283`). Verified 2026-09-14 on `Algebra/Ring/GradedCoeffs.ard`.
 
 - **A numeric literal needs a *declared* instance, so `1` fails over a `\func`-computed group.** Instance search matches the classifying field against `\instance` declarations only. `NormalSubGroup.Quot` and `PresentedGroup S R` (`Algebra/Group/Presentation.ard`) are `\func`s returning a `Group`, so `quotHom x = 1` is rejected with `Cannot infer an instance of class 'Pointed' with classifying expression: Quotient {E {S}} (~)` — write `ide {Quot}` / `ide {PresentedGroup S R}`. The same statement with the group a *variable* (`\Pi (w : …) -> R w -> f w = 1` for `{G : Group}`, `f : GroupHom _ G`) needs no annotation, because the parameter pins the instance. Verified 2026-09-14.
+  **The same holds for `*`, `inverse` and `ide` on elements of such a group, even when the
+  element is a variable.** With `g : St C (LocRing (powers t))` (`St` a `\func` returning a
+  presented group), `g * x * inverse g` fails with `Cannot infer an instance of class
+  'Semigroup' with classifying expression: Quotient {Quotient {List (\Sigma (Gen …) Bool)} (~)} (~)`:
+  the type of `g` is normalized to the presented group's carrier before instance search, so the
+  `St C …` that would pin the instance is gone. Pin the group — `(*) {St C R} g x`,
+  `ide {St C R}`, `conjugate {St C R} g x` — exactly where the operands are elements of the
+  computed group; inside `GroupHom` application positions and in `StData` (group a variable)
+  nothing is needed. Verified 2026-10-15 on the thesis repo's `src/Steinberg/Patching.ard`.
 
 - **Arithmetic on a *concrete* record instance computes, and that breaks term-level tooling.** `ComplexField.*` is implemented by a formula on `re`/`im`, so `x * y` normalizes to `\new Complex (x.re * y.re - x.im * y.im) (…)`. Note the body has no pattern matching, so this reduction is **unconditional** — it fires for two *variable* operands too, not only when one is concrete. Verified 2026-08-11: `rewrite cabs_* idp` fails on `cabs (h * h * q) = cabs h * cabs h * cabs q` for `h q : Complex` parameters, because after normalization the goal contains no `*`-application for the pattern to match. The pretty-printer re-folds the record literal, so the error displays an expression that visibly contains the pattern it reports as missing — see **arend-prove** failure mode 18. Consequences (all verified 2026-07-29, on what is now `Arith/Complex/FTA/Kneser.ard`): `equation.cRing` cannot prove even `x * y = y * x` at `Complex`; `rewrite` cannot match a pattern containing a meta under a `*`/`+`; and unification cannot infer an implicit that occurs only under one. **Keep such algebra symbolic: state the step over an abstract `{C : CRing}` (or make the operands explicit parameters of a helper) and instantiate.** Abstract class parameters are what keep a term neutral — this is a general reason a helper lemma over `{M : AbMonoid}` succeeds where the same proof inlined at the concrete instance fails. See **arend-prove** failure modes 15–17 for the diagnostics.
 
@@ -228,6 +237,17 @@ What Arend does (`tutorial/PartI/records.md`, `language-reference/definitions/re
   `Set/SetCategory.ard`). Refines §7: the opacity is not only about unification of the bound
   *value*, it also blocks field projection through an implemented parent.
 
+- **A field named like a constructor shadows it for the whole module.** A record field `| pos : R.I -> Nat`
+  is exported to module scope, so a top-level `\elim x | pos 0 => … | Int.neg 1 => …` in the same file fails
+  with `Cannot find a reference to constructor among provided patterns / In: pos 0`, which reads as a
+  pattern-syntax error. Rename the field (`ord`). Same hazard for imported fields: import a module that
+  declares a field `root` selectively (`\import M (Rec)`) when the importing file has its own `root`.
+  Verified 2026-10-13 on `src/RootSystem/FrenkelKac.ard` in the thesis repo.
+- **Explicit implicits on a record's own field or method start with `{this}`.** Inside the record (or on
+  a method called bare), `reduced {al} {ga} {0} p` hands `al` to the hidden `{this}` and reports
+  `Type mismatch / Expected type: <TheRecord> / Actual type: E {I}`. Write `reduced {_} {al} {ga} {0} p`.
+  Verified 2026-10-13.
+
 ## 5. Universes, levels, and `\Prop`
 
 What I'd expect: `Type i` with `i : Level`, cumulative or not depending on system.
@@ -238,6 +258,15 @@ What Arend has (`language-reference/expressions/universes.md`, `language-referen
 - **Homotopy levels are a separate family of universe keywords**, each carrying its own predicative level: `\Prop` (h-level -1, **impredicative** — no predicative level), `\Set n` = `\0-Type n` (h-level 0), `\n-Type m` (h-level n), and `\Type m` (untruncated). Homotopy cumulativity: `A : \Prop` ⟹ `A : \Set n` ⟹ … ⟹ `A : \Type n`. Placement: `\Prop : \Set 0`; `\k-Type p : \(k+1)-Type (p+1)`; `\Type p : \Type (p+1)`.
 - **A truncated universe needs a *finite* predicative level.** Bare `\Set` / `\n-Type` errors with "Infinite level is not allowed here"; write `\Set 0` or use a level parameter. Only `\Type` may be bare. Consequently `\func x : \Type => \Type` is rejected (the infinite `\Type` isn't a member of itself — this is what blocks Girard-style paradoxes).
 - **Level polymorphism is explicit and predicative-only.** No implicit `\lp`/`\lh`: a definition is polymorphic only if it declares named level parameters *after its name*: `\func id.{l} (A : \Type l) (a : A) => a`. Several params are comma-separated and independent: `\func f.{l1, l2} …`. A definition mentioning only bare `\Type` is **not** polymorphic (fixed at the infinite level). Homotopy level is not an abstractable axis.
+- **A record declared without level parameters cannot be a `\Pi` binder inside a definition
+  body, though it is fine as a parameter.** `\func T.{u} : \Prop => \Pi {I : DecSet.{u}}
+  {Phi : DoublyLacedRootSystem I} … -> …` is rejected with `Infinite level is not allowed here /
+  In: DoublyLacedRootSystem { | I => I }`, and `DoublyLacedRootSystem.{u} I` with `Too many level
+  arguments`: the thesis's root-system records declare no levels, so they are fixed at the
+  infinite level, and the codomain being `\Prop` does not help. The same types are accepted as
+  parameters (`\func stDiagram.{u} {I : DecSet.{u}} {Phi : DoublyLacedRootSystem I} …`). Make
+  them parameters of the statement and quantify only over level-polymorphic classes
+  (`IntegralDomain.{u}`) inside the `\Pi`. Verified 2026-10-15.
 - **Level arguments are passed with the same `.{…}` syntax**: `id.{2}`, `f.{\suc l}`, `f.{l1, l2}`. Usually inferred, so rarely written. The old `\levels p h` and positional-level forms are gone.
 - **Level expressions**: atoms are non-negative numerals and named level parameters; operations `\suc l` and `\max l1 l2`.
 - **Level of a data type** is the max over its **constructor-argument** type levels (a parameter not used by any constructor does not contribute). **Level of a record/class** is over its **unimplemented** fields. A definition that declares a level parameter `l` keeps that level: `\class C.{l} (A : \Type l) | …` gives `C.{l} X : \Type l`, even for a low-level `X` (e.g. `C.{5} Nat : \Type5`, not `\Type0`).
@@ -311,6 +340,25 @@ Measured 2026-10-12 in the thesis repo (`Algebra/Ring/ProRingPresentation.ard`),
   `Function can be declared as a lemma` warning flags these).
 
 Find hot spots with `arend --no-daemon -r --show-times [MODULE[:DEF]]` (see **arend-formalize**).
+
+**A `\let` abbreviation compared against the expression it abbreviates used to cost minutes.**
+In `\let | Lth => ofLevel … th | conjf => (conjAct …).f \in … *> pcomp-assoc … Lth conjf *> cp`,
+where the hypothesis `cp` and the lemma statements spell those terms out in full, the comparison at
+each `*>` step failed syntactically on `Lth` vs `ofLevel … th`, normalized both sides to WHNF
+(unfolding every transparent `\func`) and compared records field by field (`compareClassInstances`,
+dozens deep). Measured 2026-10-16 on the thesis repo's `strict-deep`: 3m5s as written, 3.2s with the
+`\let`s substituted by hand. The local Arend build (`~/Documents/Arend`, `CompareVisitor.compare`,
+uncommitted) now compares a `\let`-bound variable through its value before normalizing anything,
+which gives 3.6s on the unchanged proof. On a CLI without that fix: do not `\let`-abbreviate a term
+that hypotheses or cited lemmas state in full. `--show-unfolds` blamed the free group there (`++`
+unfolded 2M times) — a symptom, found out with `--show-hot-spots` and `-Darend.unfold.trace`.
+
+The same all-or-nothing comparison bit in two more spellings, and the local build takes the one
+reduction for those as well: an **alias `\func`** against the head of its body (`StPro C S` vs
+`grpObj-ofDiagram (stGD C S)` as the argument of a lemma stated with the latter: 21s → 48ms), and a
+**field of a variable whose type implements it** (`io {d}` for `d : TData {… io => io {this} …}` vs
+`io {this}`, inside a `\record`'s members: 18s → 4s). Without those changes, state such lemmas in
+the spelling their callers use.
 
 ## 8. Pattern-matching data types with varying constructors
 
@@ -496,6 +544,13 @@ For the catalog of metas (`rewrite`, `ext`, `simplify`, `equation`, `cong`, `lin
 - `\let` bindings are non-recursive and sequential (each sees the previous).
 - `\where` is a module; `f.g` accesses it from outside. **But `\private \lemma helper` inside a `\where` block makes `helper` invisible outside**, and because Arend's name resolution then falls back to treating `f.helper` as field access on `f`-the-value, the error is misleading: `Type mismatch: Expected type: a class. Actual type: <f's body type>`. If you want sibling lemmas to share helpers, either drop `\private` (so the helper is reachable as `parent.helper`) or hoist to file-level `\private \lemma` at module scope — arend-lib usually does the latter.
 
+- **`BigProd`/`BigSum` over a concrete array literal normalise away.** With `Shape.all = s11 :: … :: nil`,
+  `G.BigProd (map f Shape.all)` reduces to the explicit seven-fold product, so `BigProd-ext` /
+  `func-BigProd` cannot read their implicit arrays off the goal (`Cannot infer parameter 'l' of definition
+  'BigProd-ext'`), and pinning them gives baffling family mismatches. State the lemma over a *variable*
+  array (`(l : Array A) … : G.BigProd (map g l) = G.BigProd (map g' l)`, proved by `pmap … (ext p : g = g')`)
+  and instantiate it at the literal. Verified 2026-10-13 on `src/Steinberg/Group.ard`.
+
 ## 13. Termination checker surprises
 
 (`language-reference/term-checker.md`)
@@ -617,6 +672,20 @@ grep -rn '{-}' arend-lib/src/    # rarer: empty nested comment from `{-}` in mat
 Any occurrence of `{-`, `-}`, or `{-}` *inside* a doc comment (i.e. not the comment's own opening/closing delimiters) needs a space inserted to break the token: `{ -`, `- }`, `{ - }`. So `x^{-1}` becomes `x^{ -1}`, and `\{-1, 0, 1\}` becomes `\{ -1, 0, 1 \}`. Do this defensively after every doc-comment edit — the failure mode is silent and the diagnostic surfaces far from the cause.
 
 (Line comments `-- | ...` do not nest and are immune. Prefer `-- |` for one-liners that don't contain LaTeX braces; reserve `{- | ... -}` for multi-line docs and accept the audit cost.)
+
+**The same opener bites in code: `{-1}` as an implicit argument starts a comment.** `f {-2}` looks like
+`f` applied to the implicit `-2`, but `{-` is lexed as a block-comment opener. The two front ends then
+disagree, and the CLI is the misleading one:
+
+- **CLI (ANTLR, `buildSrc/.../Arend.g4`):** `COMMENT : '{-' (COMMENT|.)*? '-}'` is a single token, and it
+  only matches if some `-}` follows. With none later in the file, the lexer falls back to `{`,
+  `NEGATIVE_NUMBER`, `}` and the code typechecks. Add any `{- … -}` comment further down and the CLI also
+  swallows everything from `{-2}` to it. Verified 2026-10-13: the error was `Cannot infer parameter 'k'`.
+- **IntelliJ plugin (JFlex, `intellij/.../ArendLexer.flex`):** `"{-"` enters `BLOCK_COMMENT_INNER` at once,
+  with no lookahead, so the rest of the file is an unterminated comment.
+
+Write `{ -2}`, with a space. A file that passes the CLI can still be broken in the plugin, so grep for
+`{-[0-9]` before committing.
 
 ## 20. Extending records and closing inherited fields (`\extends` / `| F => v`)
 
@@ -788,3 +857,19 @@ in the old place will not keep the old path alive — update the call sites. The
 call sites names the *parent's* parameters (`Parameter 'I' must be specified explicitly. In:
 FactorRing`), never the missing member, because resolution falls back to field access on the
 value; same read-as-nonsense shape as §18.
+
+## Quirks met in the conjugation-action work (2026-10-16)
+
+- **`^{-1}` inside a doc comment opens a nested comment.** `{- | … k^{-1} … -}` and `S^{-1}R` both
+  contain `{-`, so the parser reports `Unclosed comment` at the *start* of the block. Write
+  `k^{\,-1}` or `R_S`.
+- **A record field of an imported record shadows a same-named lemma from another import.**
+  `\import Steinberg.Patching` brings `LocalConj`'s field `rep-exists` into scope, and a lemma
+  `rep-exists.{u}` imported from another module then resolves to the field. The symptoms are
+  `Too many level arguments` and a type mismatch on the first argument. Rename the lemma.
+- **`(X).*i` does not parse** for a non-variable instance `X`, and `AddGroup.*i {X} n a` in prefix
+  position is read as a section. The forms that work are `(AddGroup.*i) {X} n a`, `n P.*i a` for a
+  *bound variable* `P`, or infix `n AddGroup.*i a` when the instance is inferable from `a`.
+- **`\cowith` is not allowed in a `\let`**; use `\new R { | f => … }`.
+- **`\have` makes a term abbreviation opaque**, so `St.x g1 a1` with `a1` bound by `\have` does not
+  match `deep J1 g1 ide`. Bind data with `\let` and keep `\have` for proofs.

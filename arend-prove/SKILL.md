@@ -316,6 +316,38 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
     `Expression is applied to an argument, but does not have a function type / Argument: g / In: f`,
     naming the operands instead of the operator. Verified 2026-09-17.
 
+25. **`equation.cRing` treats `pow t (a + b)` as an atom, and `repeat` does not stop at the first
+    failed `rewrite`.** A polynomial identity whose powers have *variable sum* exponents fails with
+    `Cannot solve equation`, and the `where` list shows atoms like `pow {R} t (s + j)`. Split them
+    first with an explicit tuple, `rewrite (Monoid.pow_+ {R}, Monoid.pow_+ {R}, …) equation.cRing`:
+    each entry splits *one* sum node, and all occurrences of the instance it matched. You need
+    exactly as many entries as there are distinct sum nodes. Too few leaves compound atoms in the
+    `where` list (add one per leftover); too many reports `Cannot find subexpression`.
+    `repeat {n} (rewrite (Monoid.pow_+ {R})) e` does **not** work as "until no match": it applies
+    `n` times and fails, with a spray of `Type mismatch / Expected type: a pi type`. Also convert
+    integer multiples before the solver: `k *i x = (k *i ide) * x` (`*i_*-left` with `ide`), with
+    each `x` given explicitly in a `rewrite`. The pattern `k *i ?x` would re-match the `k *i ide`
+    it just produced. Verified 2026-10-15 on `pz-lem` / `decNat-lem` in the thesis repo's
+    `src/Steinberg/PatchingProof.ard` (19 and 22 splits).
+
+26. **Elaboration time is dominated by inference, not by the proof — pin to cut minutes to seconds.**
+    Measured on the pro-level P6/P7 work (2026-10-16), each a 30× to 100× speed-up:
+    - **Lemma calls inside a `\cowith` record implementation**, whose arguments are values of the
+      record's own fields (`| indep r r' => rep-indep r r'` with `r : \this.Rep g n c`): inferring the
+      lemma's implicits (`{pr}`, `{c}`, …) through the field took 4 minutes; passing every implicit
+      explicitly (`rep-indep {I} {Phi} {pr} {C} {R} {t} {g} {n} {n'} {c} {c'} r r'`) took 5 seconds.
+    - **Pointwise equalities in a presented group** (`St C R`, any `PresentedGroup`): a chain whose
+      intermediate types Arend must infer unfolds `St.map` into `NormalSubGroup.quot-univ` terms.
+      Stating each step as a `\have` with an explicit type took 2.5 minutes down to 6 seconds.
+    - **A failed instance search on a quotient carrier is slow**: `conjugate-via-id` without
+      `{St C R}` spent ~3 minutes before reporting `Cannot infer an instance of class 'Group' with
+      classifying expression: Quotient …`. Pin every group operation on `St` (`(*) {St C R}`,
+      `conjugate {St C R}`, `conjugate-via-id {K} {x}`) at the first sight of such a message.
+    - **Abstract the target group**: the same construction over `{K : Group}` checks in seconds
+      where it takes 80 seconds at `K = St C R`. Prove it generically and instantiate at the end.
+    Bisect a slow definition by replacing tails of its body with `{?}`. Unchanged definitions are
+    cached per definition, so each probe costs only the edited one.
+
 ### Workflow and language gotchas
 
 - **A `Termination check failed` on an obviously-decreasing recursion is usually fallout from an
@@ -332,6 +364,12 @@ The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (p
   Only the first line is real (here: a class `\func` member needs qualifying — **arend-quirks** §4).
   Reordering parameters or hoisting a helper to "fix the recursion" achieves nothing. Verified
   2026-09-14; general instance of *Chasing type errors while unresolved references remain*.
+
+- **A solver at the end of a chain inside `inv (…)` has no target.** `N-just q *> inv (pmap negative X *> equation.cRing)`
+  elaborates the inner chain first, with its right end unknown, and the solver reports a nonsense
+  `Cannot solve equation: v0 = -v0`. Move the solver to where both neighbours pin it:
+  `N-just q *> equation.cRing *> inv (pmap negative X)`. A solver *between* two concrete steps is fine.
+  Verified 2026-10-13.
 
 - **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
 

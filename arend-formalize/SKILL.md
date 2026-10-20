@@ -337,6 +337,7 @@ above. State the relation pointwise instead — `(x : G) (q : closure S x) : clo
 | "Ignore stale binary caches after a refactor or a hang." | `--no-daemon -r` (plain `-r` is ignored by the daemon) |
 | "The daemon is wedged / denies a visible definition." | `--daemon-stop`, then `-d` again |
 | "Which definitions are slow?" | `--no-daemon -r --show-times [MODULE[:DEF]]` (`--show-sizes` for core-term sizes). A `:DEF`-scoped run checks only that definition's dependencies. Not daemon-served: the daemon re-checks only definitions whose resolved AST changed, so it reports ~0ms for the rest. For bisection, add variant definitions to a scratch copy of the library and time them all in one run. Cause and cures: **arend-quirks** §7. |
+| "Why is this definition slow?" | `--no-daemon --show-hot-spots MODULE[:DEF]`: for the 25 slowest definitions, the subexpressions the time went into (1ms samples; `incl` = inside it, `self` = innermost), so a single chain step or argument stands out. `--show-unfolds`: which definitions the normalizer unfolded, most frequent first. `-Darend.unfold.trace=NAME` (JVM option, with `--show-unfolds`; `-Darend.unfold.trace.every=N`, and `-XX:MaxJavaStackTraceDepth=20000`) prints the typechecker stack at every N-th unfolding of `NAME`. Unfold counts can point at a symptom; check with `--show-hot-spots` before changing code. Added 2026-10-16 to the local CLI (`~/Documents/Arend`, uncommitted). |
 
 ### `-ss` dialect reference
 

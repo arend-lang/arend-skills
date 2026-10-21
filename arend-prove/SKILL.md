@@ -1,920 +1,493 @@
 ---
 name: arend-prove
-description: Procedural workflow for filling in `{?}` placeholders in an Arend file once the statement already typechecks, PLUS the catalog of metas (`rewrite`, `run`, `in`, `at`, `cases`, `mcases`, `simplify`, `equation`, `cong`, `ext`, `linarith`, `unfold`, `assumption`, `using`, `later`) you'll reach for there. Use whenever an .ard file is at the "only GOAL errors remain" stage, or whenever it imports from `Paths.Meta` / `Meta` / `Algebra.Meta` / `Function.Meta` / `Logic.Meta`. Complement to **arend-formalize** (which gets you to "only GOAL"). Covers the proof-attempt feedback loop, when to decompose vs. attempt directly, the meta semantics and a decision table, mechanical gotchas, and the lookup discipline (`-ss`, `-ps`, `-fu`, `-ch`).
+description: Procedural workflow for filling in `{?}` placeholders in an Arend file once the statement already typechecks, PLUS the catalog of metas (`rewrite`, `run`, `in`, `at`, `cases`, `mcases`, `simplify`, `equation`, `cong`, `ext`, `linarith`, `unfold`, `assumption`, `using`, `later`, `repeat`) with their failure modes. Use whenever an .ard file is at the "only GOAL errors remain" stage, or whenever it imports from `Paths.Meta` / `Meta` / `Algebra.Meta` / `Function.Meta` / `Logic.Meta`. Complement to **arend-formalize** (which gets you to "only GOAL" and owns the CLI tooling and lemma lookup). Covers the proof loop, decomposition, imports, meta semantics, a decision table, an error-to-first-move table, and proof style.
 user-invocable: true
 ---
 
 # Proving in Arend — proof loop and meta catalog
 
-Picks up from **arend-formalize** ("statement typechecks, only `{?}` remain"). Covers the inner loop of closing those goals AND the catalog of metas you'll reach for. Companion to **arend-quirks** (language paper-cuts). Write-time style and compaction idioms are summarized in *Style — compaction* below and in **arend-formalize**; they are the target the *first* time, not just on a post-pass.
+Picks up from **arend-formalize** ("statement typechecks, only `{?}` remain"). Language semantics that proofs trip over (records, instances, implicits, opacity) are in **arend-quirks**.
 
-A meta is surface syntax that elaborates to ordinary kernel terms (transport, pmap, etc.). Failures look like normal type errors, but the *cause* is usually one of: wrong imports, `\lemma` vs `\func` mismatch, or asking the meta to do more than it actually can — see *Common failure modes* below.
+Typecheck in rounds against a daemon and look lemmas up before writing them: see **arend-formalize**, *0. Tooling: daemon, caches, where to run* and *1. Orient: look things up before writing*.
 
----
-
-## Before anything: start the daemon
-
-Closing goals is iterative — you'll typecheck dozens of times, and the per-round cost is JVM startup plus a full library load, not your edit. Pay it once:
-
-```bash
-cd /path/to/arend-lib && arend . -d --serialize   # once per session
-arend . <Module>:<def>                        # every round after — auto-routes to the daemon
-```
-
-The daemon is a long-lived JVM holding a warm `ArendServer`. Bootstrap runs the ordinary typecheck pipeline once over the library, with the flags `-d` forwarded (`-s -e -m -c -r --serialize`), then it idles; **every later `arend` call in that library routes to it automatically**, no client-side flag. Rounds come back in seconds. `--daemon-ping` reports `IDLE`/`BUSY`, `--daemon-refresh` replays that frozen bootstrap argv against the warm context so source edits are picked up, `--daemon-stop` shuts it down, and `--no-daemon` forces one call in-process.
-
-> **`--serialize` exists and is opt-in.** Registered in `ConsoleMain.parseArgs` as *“after typechecking, persist typechecked
-> modules as .arc binary caches; **without this flag, no .arc files are written**”*. There is **no `--no-serialize`**.
-> An earlier revision of this skill claimed the flag had been removed and serialization was on by default — wrong on both
-> counts. Because `serialize` is also one of the flags the daemon locks, **pass it on the `-d` bootstrap**
-> (`arend . -d --serialize`); passing it on a served call is parsed, warned about and discarded.
-
-**The daemon silently ignores `-r`.** On a daemon-served call, `-L`, `-s`, `-e`, `-m`, `-c`, `-r` and `--serialize` are parsed and then discarded in favour of the daemon's bootstrap values (`LockedFlags.NAMES`; `--slow-warn` does not exist at all). So when you hit phantom errors on definitions you didn't touch, bogus mismatches naming the same type twice (`Rat` vs `Arith.Rat.Rat`), or a stack trace out of the (de)serializer, the recovery is **`arend --no-daemon -r --serialize <Module>`** — `--no-daemon` so `-r` actually applies, `-r` to skip loading the `.arc` caches, `--serialize` so the clean build actually *replaces* them. Leave `--serialize` off and the repaired result is never written: the next call reads the same poisoned cache.
-
-**If the daemon itself is wedged, restart it.** A transient resolution error can leave the warm server denying a definition that is plainly visible in the sources; in-daemon `-r` cannot recover it (it's ignored), and `--daemon-refresh` is not reliable here. Use `arend . --daemon-stop && arend . -d`. Separately, older builds reported stored resolver errors only on the first run, so a warm re-run of a broken module could exit 0 in silence (arend-lang/Arend#138, fixed 2026-08-08); on a current build warm exit codes are trustworthy and errors print after the banner.
+A meta is surface syntax that elaborates to ordinary terms (`transport`, `pmap`, …). Its failures look like ordinary type errors; the cause is usually a missing import, a `\lemma` whose type is not a proposition, or asking the meta for more than it does.
 
 ---
 
 ## The inner loop
 
-For each `{?}` you intend to attack:
+For each `{?}`:
 
-1. **Read its full `[GOAL]` block.** Both the expected type *and* the binder list (`Context: ...`). For sub-goals inside `\have` / `\case` chains, the binder list is what tells you what's in scope. Scope the run with the positional rather than filtering the output: `arend . <Module>` lists every goal and error in that module, `arend . <Module>:<def>` narrows to a single definition.
-2. **Decide: prove, or decompose?** (See next section.)
-3. `arend . <Module>:<def>`. Read the first error or remaining GOAL. Iterate.
+1. **Read the whole `[GOAL]` block** — the expected type *and* `Context:`, which is what tells you what is in scope inside `\have` / `\case` chains. Narrow the *scope*, not the output: `arend <Module>` lists every goal and error of a module, `arend <Module>:<def>` checks one definition. Do not `grep GOAL`: it cuts off the `Expected type:` / `Context:` lines.
+2. **Prove or decompose** (below).
+3. **Re-run, read the first error** or the remaining goal, iterate.
+4. **Before stating a helper lemma, run `-ps "<its shape>"`.** A hit saves the lemma; `No matches` confirms you need it.
+5. **When it typechecks, re-read it against the goal you meant.** Typechecking proves consistency, not faithfulness.
 
----
+### Decompose
 
-## Decomposition is the main move
+Don't write a 200-line proof as one expression. For any goal that takes more than one mathematical step:
 
-Don't write 200 lines of proof in one expression. Any goal that takes more than one mathematical step:
+- name each step as its own helper lemma with a clean type;
+- replace the original `{?}` with the combination of the helpers;
+- leave a hard helper as `{?}` — the structure now typechecks, the difficulty is isolated, and the rest of the file can use the helper as a black box (and the work can be split across sessions).
 
-- Name each step as its own helper lemma with a clean type.
-- Replace the original `{?}` with `combine(helper1, helper2, ...)`.
-- Leave any helper as `{?}` if it's hard — the structure now typechecks, the difficulty is isolated, and downstream proofs can use the helper as a black box.
+Heuristic: if you can't write the proof in one breath, name the next sub-statement as a helper and continue.
 
-A `{?}`'d helper with the right type is more valuable than a half-finished inline proof: it commits you to the proof's structure and lets the rest of the file move forward. It also lets you split work across sessions — name the hard helper, prove the easy half, come back to the hard half later.
+### Missing helpers
 
-> Heuristic: if you can't write the proof in one breath, name the next sub-statement as a helper and continue.
-
----
-
-## Upstream missing prerequisites
-
-If you find yourself wanting a 1–5 line helper that should exist (`partialSum_suc`, `BigSum_assoc`, monotonicity-of-X), go add it to the right module instead of working around its absence. Working around is typically 10× the size of the right helper, and you'll keep wanting it across multiple proofs.
-
-**Do not log missing helpers/statements in `arend-issues.md`.** A gap in arend-lib is not an "issue" — it's a contribution opportunity. Just add the helper to the right module and move on. `arend-issues.md` is reserved for tooling friction (typechecker quirks, slow CLI paths, misleading error messages), not library gaps.
+If a 1–5 line helper that should exist is missing, add it to the right module instead of working around it — the workaround is typically ten times longer and you will want the helper again. A missing library statement is not an issue to report.
 
 ---
 
-## Imports — what comes from where
+## Imports
 
 | Need | Import |
 |---|---|
-| `idp`, `pmap`, `transport`, `transportInv`, `inv`, `*>`, `coe` | `Paths` |
-| `rewrite`, `rewriteI`, `ext`, `simp_coe` | `Paths.Meta` |
-| `run`, `in`, `at`, `cases`, `mcases`, `unfold`, `assumption`, `later` | `Meta` |
-| `$`, `#`, `repeat`, `__` (anonymous-section placeholder) | `Function.Meta` |
-| `equation`, `cong`, `linarith`, `simplify` | `Algebra.Meta` |
+| `idp`, `pmap`, `pmap2`, `transport`, `transportInv`, `inv`, `*>`, `==<` / `>==` / `qed` | `Paths` (`=`, `Path`, `coe` are Prelude) |
+| `rewrite`, `rewriteI`, `ext`, `exts`, `simp_coe` | `Paths.Meta` |
+| `run`, `in`, `at`, `cases`, `mcases`, `unfold`, `unfold_let`, `unfolds`, `assumption`, `later`, `using`, `usingOnly`, `hiding`, `defaultImpl`, `<\|>` / `try` | `Meta` |
+| `$`, `#'`, `repeat` | `Function.Meta` |
+| `equation`, `cong`, `linarith`, `simplify`, `rewriteEq` | `Algebra.Meta` |
+| `∃`, `contradiction` | `Logic.Meta` |
+| `Empty`, `Not`, `\|\|`, `<->`, `propExt` | `Logic` |
+| `Or`, `inl`, `inr` | `Data.Or` |
 | `Quotient`, `in~`, `~-equiv`, `Equivalence` | `Relation.Equivalence` |
-| `Empty`, `Not`, `&&`, `||`, `propExt` (the type) | `Logic` |
-| `contradiction`, `cases`-style logic helpers | `Logic.Meta` |
-| `Pointed`, `Monoid`, `Group`, `Ring`, `Semiring` classes | `Algebra.{Pointed,Monoid,Group,Ring,Semiring}` |
-| `LinearlyOrderedSemiring`, `OrderedRing` (the classes `linarith` dispatches on) | `Algebra.StrictlyOrdered` and/or `Algebra.Ordered` |
-| `Nat` as a `LinearlyOrderedSemiring` instance, `<`, `<=` on `Nat` | `Arith.Nat` |
+| `ide` / `*` / `+` / `inverse`, `negative` / `CRing`, `Ring`, `PseudoCRing` | `Algebra.Pointed` / `Algebra.Monoid` / `Algebra.Group` / `Algebra.Ring` |
+| the operators `<=` / `<` | `Order.PartialOrder` / `Order.StrictOrder` |
+| `LinearlyOrderedSemiring`, `OrderedRing` (what `linarith` dispatches on) | `Algebra.StrictlyOrdered` |
+| the instances on `Nat` / `Rat` / `Real` (so `+`, `<=`, solvers work there) | `Arith.Nat` / `Arith.Rat` / `Arith.Real.Field` |
 
-**Boilerplate that almost always works for an algebraic-meta file:**
+Operators and instances come from different modules: bare `+` or `<=` on `Nat` needs `Algebra.Monoid` / `Order.PartialOrder` *and* `Arith.Nat`. `Nat.+` and `Nat.*` (qualified, from the Prelude) work without either.
+
+Boilerplate that covers most algebraic proofs:
 
 ```arend
-\import Algebra.Meta
 \import Algebra.Group
+\import Algebra.Meta
 \import Algebra.Monoid
 \import Algebra.Pointed
 \import Algebra.Ring
-\import Algebra.Semiring
+\import Algebra.StrictlyOrdered
+\import Arith.Nat
+\import Function.Meta
 \import Logic
 \import Logic.Meta
 \import Meta
+\import Order.PartialOrder
+\import Order.StrictOrder
 \import Paths
 \import Paths.Meta
 ```
 
-For an equality-meta file (no algebra needed):
+`Meta`, `Paths.Meta`, `Algebra.Meta`, `Function.Meta`, `Logic.Meta` are provided by the library's Java extension: they import fine but are not files under `src/` — don't grep for them.
 
-```arend
-\import Paths
-\import Paths.Meta
-\import Meta
-\import Function.Meta
-\import Logic
-```
+**Symptoms of a missing or shadowing import:**
 
-The names `Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta` are *virtual* (provided by the Java extension `org.arend.lib.StdExtension`) — they don't appear as files in `arend-lib/src/`, but they import fine. Don't grep for them.
+- `Cannot resolve reference 'X'` — the module defining `X` is not imported (`Empty` → `Logic`, `negative` → `Algebra.Group`, `ide` → `Algebra.Pointed`, `<=` → `Order.PartialOrder`). A class's `\func` members (`pow`, `*n`, …) do not resolve bare even when imported: write `Monoid.pow` — see **arend-quirks**, *Records and classes*.
+- `Cannot find a reference to constructor among provided patterns` / `In: inl a` — the type is visible but its constructors' module is not imported (`inl`/`inr` need `Data.Or`; `in~` needs `Relation.Equivalence`). Importing only the type, `\import Data.Or (Or)`, gives the same error. The message never says "import".
+- `ext` reporting `Expected type: \Pi (i : I) -> ?A i` — see *ext* below; often the same missing `in~` import.
+- `ambiguous reference`, or `linarith`/`equation` not finding an instance that is plainly there — a local definition with a library name (a tutorial-style `\class Monoid`, a local `\data Empty`) shadows the library's. Drop or rename the local one.
 
 ---
 
-## Common failure modes (read this first)
+## Metas
 
-### Meta- and goal-language failure modes
+### `rewrite` / `rewriteI` — rewrite in the goal
 
-1. **`\lemma` requires the type to be a proposition.** `f x = f y` for `f : A -> B` with `B : \Type` is *not* a Prop — it lives in `\Type`. The error is `The type of a lemma must be a proposition`. Default to `\func`; promote to `\lemma` only after a clean typecheck reports a warning.
-
-2. **`simplify` is not a decision procedure.** It strips identity elements, double inverses, zeros — that's it. It does *not* do commutativity or distribution, and it can fail even when both sides should normalize to the same expression (e.g. `x * x = (x * (ide * x)) * ide` fails on a `Monoid`). When `simplify` fails, fall back to `equation`, manual `rewrite`, or `pmap` chains.
-
-3. **Imports are unforgiving.** Every meta lives in a specific module. Missing `Logic` → `Empty` is unresolved. Missing `Algebra.Group` → `negative` is unresolved. The virtual modules (`Algebra.Meta`, `Paths.Meta`, `Meta`, `Function.Meta`) import fine but don't appear in `arend-lib/src/`.
-
-4. **`Nat.<=` does not parse.** `Nat` is a `\Set0`, not a class. Use bare `<=` after `\import Arith.Nat`. The arithmetic operators `Nat.+` and `Nat.*` *do* parse — those are special syntactic sugar resolved by the language, not class-member access.
-
-5. **`Empty` from `Logic` collides with a local `\data Empty`.** If `Logic` is in scope, drop the local `\data Empty`. Mixed scope = "ambiguous reference".
-
-6. **`run { f1, f2, ..., t }` puts the seed at the *end*, not the start.** `run { rewrite p, rewrite q, idp }` means `rewrite p (rewrite q idp)`. If you put `idp` first, you've inverted the chain.
-
-7. **`rewrite p in t` ≠ `rewrite p t`.** `in` strips the expected type and uses `t`'s type instead. For *most* metas this is invisible. For `rewrite`, which inspects the expected type to find the LHS, the difference is observable. If `rewrite p q` complains about not finding the LHS, try `rewrite p in q`.
-
-8. **`Records.ard` from `tutorial-code-fresh` (`/home/sergey/Documents/tutorial-code-fresh/PartI/src/Records.ard`) defines its own `Monoid`/`Ring`/...** It will shadow arend-lib's classes — `linarith` and friends won't see the right instances. Either don't `\import Records` in a metas file, or rename the local classes.
-
-9. **A meta inside `run { ... }` with a mysterious type error usually wants `later $`.** `later` (from `Meta`) defers a meta invocation until type inference has resolved more of the expected type. When the intermediate goal at some position in a `run` chain isn't pinned down enough for the meta to fire, prefix with `later $`: `run { later $ rewrite p, idp }`. Rule of thumb: if a meta in the middle of a `run` complains about an unresolved goal but the same meta works on its own, try `later $`.
-
-10. **`equation` defaults to the non-commutative ring solver.** If you call plain `equation` on an identity that needs `*`-commutativity (e.g. anything over `Rat`, `Real`, or any concrete commutative ring), it fails with `Ring solver failed` and the printout shows the two sides differing only by argument order — `v0*v1*v2` vs `v2*v0*v1`. The error message doesn't suggest the fix. Use `equation.cRing` for commutative rings, `equation.cMonoid` for commutative monoids, `equation.monoid` for non-commutative monoids. Established practice in `Algebra/Ring/Localization.ard` and `Algebra/Linear/Matrix.ard`. When the structure is *abstract* (`{R : CRing}` etc.), `equation` may pick the right solver from the class — but for concrete arithmetic over `Rat`/`Real`/`Nat` you almost always need the explicit `.cRing` qualifier. **In-chain vs bare ascription:** the *standalone* `(equation.cRing : LHS = RHS)` over concrete `Rat` fails with `Cannot infer an instance of class 'CRing' with classifying expression: Rat` (nothing drives the instance), but the *same* `equation.cRing` embedded in a `*>` chain — `inv (equation.cRing *> pmap (…) lemma *> …)` — infers fine because the chain position pins its expected type. So when ascription fails, drop the ascription and let the chain pin the type rather than adding `{instance}` or a hand-written rearrange helper.
-
-    **There is no commutative-*rng* solver, and the fallback is silent.** At `{R : PseudoCRing}`
-    (no `ide`) `equation` dispatches to the **Monoid** solver, so it loses both commutativity and
-    distribution and fails on identities it closes instantly one class up. The tell is the solver
-    named in the error, not the goal: `Monoid solver failed` on sides that differ only by
-    `*`-commutativity or a distribution step. `equation.cRing` needs a unital `CRing` and
-    `equation.cMonoid` a unital `CMonoid`, so neither substitutes. Verified 2026-09-14 while
-    testing whether `Algebra/Ring/Homotope.ard` weakens from `CRing` to `PseudoCRing`: four
-    one-word proofs would have become hand-written chains. If you need rng-level algebra, write
-    the chains (`pmap (* z) *-assoc *> *-assoc` and friends) or keep the unital hypothesis.
-
-11. **`linarith` over `Real` finds its instance with just `\import Arith.Real.Field`** (since commit `ab3dc1dba`, which added `solveEquationsFor` to push a single inference variable). The old quirk — "needs `\open RealField`, instance resolution is unstable if multiple `linarith` calls coexist without the open" — no longer reproduces; verified with both implicit `{x : Real}` and explicit `(x y : Real)` parameters, with and without multiplication. If you still see `Cannot infer an instance of class 'LinearlyOrderedSemiring' with classifying expression: Real`, check the import is actually present; `\open RealField` is no longer required. (For `Rat`, `\import Arith.Rat` suffices for the same reason; for abstract `{R : LinearlyOrderedSemiring}` the instance was always pinned by the parameter.)
-
-11b. **`linarith` does not distribute products of sums, and it is sensitive to monomial order.** Two limitations that together account for most "the printed assumptions clearly imply the goal, yet `Cannot solve the equation`" failures:
-
-    - **A product one of whose factors is a non-constant sum is a single opaque atom.** `A * R * (1 - t) + eps * s` is linear once expanded, but `linarith` will not expand it — nor will it expand `(s + 1) * eps < q * (c - a0)`. Restate every such hypothesis in hand-distributed form and bridge with `<∘l =_<= equation.cRing` (or `=_<= equation.cRing <∘r (h <∘l =_<= equation.cRing)` when *both* sides need reshaping — `<∘l` only touches the right end).
-    - **`eps * pow 3 n` and `pow 3 n * eps` are different atoms.** Two hypotheses that differ only in a product's factor order cannot be combined. Fix the order by hand across every hypothesis *and* the goal; the error output gives no hint that this is the problem, because the two spellings read as the same quantity.
-
-    Also folding-related, same family:
-
-    - **A `\func`-defined constant is not unfolded — but a `\meta` one is.** With `\func one/3 : Real => ratio 1 3`, the goal `pow one/3 n * eps <= one/3 * eps` carries no numeric content: `one/3` is an atom, and even `one/3 > 0` fails with `Cannot solve the equation`. Spelling out `(ratio 1 3 : Real)` at every site works but is verbose and leaves the file with two spellings of one constant. **The fix that keeps the abbreviation is `\meta`**, which is pure syntactic substitution, so `linarith` sees the literal:
-
-      ```arend
-      \private \meta one/3 => (ratio 1 3 : Real)                    -- linarith sees through this
-      \private \lemma one/3>0 : one/3 > {RealField} 0 => linarith   -- now closes
-      ```
-
-      **The ascription is mandatory.** A bare `\meta one/3 => ratio 1 3` expands to a `Rat`, and every `pow one/3 k` then loses the instance that `one/3 : Real` used to pin — verified as ~12 `Type mismatch` / `Cannot find subexpression` errors across one file. Live use: `Arith/Complex/FTA/Kneser.ard:48`, where switching `\func` → `\meta` let all 14 workaround spellings of `ratio 1 3` collapse back to `one/3`.
-
-      A *parameterised* `\func` such as `kneser-q n => 1 - pow one/3 (2 * n * n + n)` is a different case — it stays folded and is meant to (the named `kneser-q>0` / `kneser-q<1` lemmas are its interface). There, restate the goal with the body spelled out and convert at the end via `=_<= equation.cRing`.
-    - **`Real.fromRat 1` is not the literal `1`** as far as the solver is concerned, even though they are definitionally equal. Re-annotating the hypothesis (`\have | h' : <same statement with 1> => h`) costs nothing and fixes it.
-    - **Trim the context with `usingOnly`.** Past ~20 hypotheses the solver starts failing on goals it can do; and unrelated `Nat` facts in scope print as `coefMap {?this} (fromInt …)` with unresolved metas. `usingOnly (h1, …, h5) linarith` both speeds it up and makes the failure output readable.
-
-    Worked example: `Arith/Complex/FTA/Kneser.ard:KneserLemma` (was `Arith/Real/KneserLemma.ard`, moved 2026-08-10) — `sums'`, `cond2'`, `q-eq`, `lower-scaled`, `eps-third` exist purely to hand the solver a distributed, order-normalised, `usingOnly`-restricted system.
-
-12. **`linarith` chokes on symbolic identities — reach for `equation.cRing` instead.** `linarith` solves *linear (in)equalities* with atoms; it can normalize `2 * x + 3 * y <= 5` but not `(A - B) - (A + B) = -2 * B` where the goal is a symbolic identity (`2` may appear as `natCoef 2`, `negative (...)` blocks linarith's normalization). When linarith fails with `Cannot solve the equation` and prints two algebraically-equivalent sides (often differing in `natCoef 2` vs literal `2`, or by `negative` placement), switch to `equation.cRing`. Rule of thumb: linarith is for **numeric** inequality goals; `equation.cRing` is for **polynomial-identity** equality goals; they don't substitute for each other even when both seem applicable.
-
-13. **`series_<=` needs its bound function to return `ExUpperReal`-typed values** with the `<=` resolved to `ExUpperRealAbMonoid.<=` (not generic `LinearOrder.<=`). When passing a bound to `series_<=`, write the result type with explicit `ExUpperRealAbMonoid.<=` qualifier, otherwise unification picks `LinearOrder.<=` and fails. The error reads `Cannot infer parameter 'b' of definition 'series_<='` — that's the symptom.
-
-14. **An in-scope `RealStoneC*Algebra` (or any `StoneC*Algebra Real`) instance breaks `linarith` over `Real`.** `StoneC*Algebra` carries the C\*-positivity order (`0 <= a ⟺ ∃ y, a = y*y`). With that instance in scope (e.g. via a plain `\import Topology.StoneCStarAlgebra`), `linarith`/`=_<=` over `Real` resolve `<=`/`<` to the C\*-order instead of `RealField`'s linear order, and the goal explodes into `TruncP (\Sigma (y : E) (y * y = ...))` — Fourier–Motzkin can't run on it. The symptom is a `Type mismatch` whose *actual* type is that `TruncP (\Sigma (y : E) (y Semigroup.* y = ...))` form, on a `linarith` that combines hypotheses (trivial single-identity `linarith` often still passes, which is why `Arith/Log/Real.ard` survives — its goals are trivial). Merely being in scope makes it an instance-search candidate — `\open RealField` is irrelevant, and even a narrow `\import M (RealStoneC*Algebra)` still pollutes (it's still in scope).
-
-    **Best fix — empty-import + local `\where \open`, no file split needed.** `\import Topology.StoneCStarAlgebra()` (empty parens) makes the module *referenceable for `\open`* while pulling **no** names into file scope, so the instance is not a global search candidate. Then, on each of the handful of definitions that actually need it, scope the name locally:
-    ```arend
-    \import Topology.StoneCStarAlgebra()          -- module referenceable, nothing in scope
-    ...
-    \sfunc arctan (x : Real) (|x|<1 : abs x < 1) : Real
-      => arctan-gen x (real_<_U.1 |x|<1)
-      \where \open Topology.StoneCStarAlgebra
-    ```
-    (Verbatim from `Arith/Trig/ArcTan.ard:47,110–112` as of 2026-07-28. A narrower `\open Topology.StoneCStarAlgebra(RealStoneC*Algebra)` works too; the file currently opens the whole module inside the `\where`, which is equally safe because the `\where` scope doesn't leak.)
-    The whole `arctan` / `tan-arctan` development stays in one file (`Arith/Trig/ArcTan.ard`); the `linarith` proofs never see the instance. This is the idiom whenever you need a concrete `Real` Banach-algebra instance (for `arctan`, `log1+`-over-Real, etc.) in a file that also does `Real` field-arithmetic.
-
-    *Heavier alternative (avoid unless the empty-import idiom can't apply):* mirror the `Arith/Log.ard` (generic) + `Arith/Log/Real.ard` (Real-specific) split — move the `RealStoneC*Algebra`-needing definitions into a base module that imports `StoneCStarAlgebra`, and import *that* base (not `StoneCStarAlgebra`) into the arithmetic file. Arend imports are non-transitive, so the instance stays out of the consumer's scope.
-
-15. **`rewrite` searches the goal *syntactically*; it does not reduce the goal to expose a pattern.** Unification (`*>` chains, argument positions) normalizes, `rewrite`'s subexpression search does not. So a step whose LHS only appears *after* a reduction fails with `Cannot find subexpression`, even though the same lemma works fine as a chain element. Concretely, `BigSum (\new Array M 1 (f __))` reduces to `f 0 + 0` under unification, so `zro-right *> ide-right` typechecks against it — but `rewrite zro-right` reports
-
-        Cannot find subexpression: {?error} + zro {{?error}}
-           Expression: BigSum {…} (\new Array Complex 1 (\lam p0 => …)) + BigSum … = b 0
-
-    Same for `pow x 0 → ide` and `pow z (suc k) → pow z k * z`. **Rule: when the pattern needs the goal to reduce first, write the step as a `*>`/`pmap` chain instead of a `rewrite`.**
-
-16. **Concrete `Complex` (any record whose ring operations compute on fields) defeats both `equation.cRing` and `rewrite`.** `ComplexField.*` / `.+` unfold to `\new Complex (x.re * y.re - x.im * y.im) (…)` as soon as one operand is concrete, so:
-
-    - `equation.cRing` on a `Complex` identity fails — the solver normalizes into `re`/`im` components and reports two unequal component-wise expressions (`v0 = …`, `v1 = …` full of `.re`/`.im`). Verified 2026-07-29: even `\lemma p {x y : Complex} : x * y = y * x => equation.cRing` fails. **Fix: state the algebraic step over an abstract `{C : CRing}` and instantiate it at `ComplexField`** — that is what the `cring-*` helpers in `Arith/Complex/FTA/Kneser.ard` (`opposite-direction \where`) exist for; they are load-bearing, not scaffolding. Give the helper a hypothesis (`(h : x * z = negative (e * y))`) so one lemma covers a whole rearrange-and-substitute step.
-    - A meta *inside* a concrete-`Complex` operation is unsolvable: matching `cabs (?x * ?y)` against `cabs (b i * pow z i)` becomes higher-order once `*` unfolds, so `cabs_*`, `cabs_+`, `cabs_negative` need their implicits spelled out (`cabs_* {b i} {pow z i}`) — or, better, the operands must be *variables*, i.e. parameters of a helper lemma (`dir-cabs (b0 bk : Complex) (t : Real)`). Metas in **bare** positions are fine: in `cabs_+3 (X : Complex) {Y Z : Complex} … : cabs (X + (Y + Z)) <= cabs X + (y + z)`, `Y`/`Z` are inferred from the two bound arguments' types, but `X` had to be made explicit because its only other occurrence is under the `+`.
-
-17. **`rewrite zro_*-left` / `zro_*-right` over `Real` can misfire.** `zro * x` normalizes to `fromRat zro`, so the pattern that gets searched is not the one you wrote and the rewrite can hit the wrong side (symptom: an argument's expected type collapses to `zro < fromRat zro`). Use `transportInv (\`< <the other side>) zro_*-left h` there — the explicit motive says exactly which occurrence to abstract.
-
-18. **`rewrite cabs_*` (bare implicits) cannot match a `Complex` product, and the error prints an `Expression:` that visibly contains the pattern it says is missing.** `ComplexField.*` is `\lam x y => \new Complex (x.re * y.re - x.im * y.im) (…)` — a body with no pattern matching, so it reduces **unconditionally**, for variable operands too. `h * h` therefore normalizes to a record literal and the goal contains no `*`-application at all; the pattern `cabs (?x * ?y)` has nothing to bind to, so the metas stay unsolved. The pretty-printer re-folds the record literal back to `h * h`, which is why the diagnostic reads as a contradiction:
-
-        [ERROR] Cannot find subexpression
-          Subexpression: cabs ({?error} * {?error})
-             Expression: cabs (h * h * q) = cabs h * cabs h * cabs q
-        [ERROR] Cannot infer parameter 'x' of definition 'cabs_*'
-
-    Verified 2026-08-11 on Arend 1.12. **`{?error}` metas inside a "cannot find subexpression" message mean the pattern was never built** — read it as "could not solve the implicits", not "the term is absent".
-
-    Scope, measured rather than guessed: it is *not* tuple-specific (a single `rewrite cabs_* t` fails the same way), *not* goal-shape-specific (equality and `<=` goals both fail), and *not* a general `rewrite` weakness (`rewrite NatSemiring.+-comm idp` on `Nat` works, tuple or not). It is specific to operations on a concrete record instance.
-
-    Two fixes:
-    - **Spell the implicits**: `rewrite (cabs_* {h * h} {q}, cabs_* {h} {h}) t` typechecks the otherwise-identical goal.
-    - **Hoist to a helper with explicit parameters** when the operands are long: `\lemma cabs_*3 (x y q : Complex) : cabs (x * y * q) = cabs x * cabs y * cabs q`, then `rewrite (…, cabs_*3 h h <third factor>) …`. Inside the helper the implicits still need spelling out.
-
-    Same cause, different surface: bare `cabs>=0` fails where `RealField.<=_*_positive_positive cabs>=0 cabs>=0` is expected — write `cabs>=0 {h}`. Live instance: `Arith/Complex/Algebraic/Taylor.ard:polyTaylor2-bound`. This is the `rewrite` face of failure mode 16 and of **arend-quirks** §4's concrete-record note; it is *not* mode 15 (pattern present only after a reduction the search won't perform).
-
-19. **`cases (e arg addPath)` binds pattern components whose types are unsolved metas, so `\Sigma`-eta does not fire on them and two such witnesses will not compose.** `\Sigma` (the unit) *does* have definitional eta — `\lemma unit-eq {u t : \Sigma} : u = t => idp` typechecks. But inside two sibling `cases (… arg addPath)` blocks over `Or B (\Sigma)`, the unit components bound by the `inr` patterns do not unify, and `p *> inv q` fails with a type mismatch whose two sides print *identically*:
-
-        Expected type: e.f (inr {A} {\Sigma} ()) = inr {u} u
-          Actual type: e.f (inr {A} {\Sigma} ()) = inr {t} t
-
-    Note the tell: the left-hand sides carry solved implicits (`{A} {\Sigma}`) while the right-hand sides print the bound variable in the *implicit* slot — that slot is an unsolved meta, and eta cannot fire on a term of unknown type. Writing `_` instead of naming the pattern variable makes it worse (both sides print `inr {_x} _x` and the mismatch looks like a compiler bug).
-
-    Fix: force the types at the composition site — `p *> inv (q *> pmap (inr {B} {\Sigma}) (unit-eq {t} {u}))`. Spelling `inr`'s implicits solves the metas, and the explicitly-instantiated eta lemma supplies the path. Verified 2026-08-13 on Arend 1.12, `Set/Fin/Subtraction.ard:punch-inv`.
-
-20. **A conditional algebraic identity: `pmap` the hypothesis into a bridging step first; reach for a *pivot identity* only when one step cannot bridge.** `{...}` holds chain step proofs, so the working shape is one line:
-
-    ```arend
-    \lemma comm_conjugate {E : Group} {g h : E} (p : commutator g h = ide) : conjugate g h = h
-      => equation.group {pmap (* h) p}
-    ```
-
-    Read the goal, ask "what context turns `p`'s two sides into my two sides", and `pmap` that context. Five of the six conditional commutator lemmas in `Algebra/Group.ard` are exactly this.
-
-    **The diagnostic when a step does not bridge is actively misleading** — it prints a *normalised* expected type while reporting a search over the *un-normalised* goal, so the subexpression it calls missing is visible in the line beneath it:
-
-    ```
-    [ERROR] Cannot find subexpression
-      Expected type: d * b * c * b^-1 * d^-1 * b * c^-1 * b^-1 = b * d * c * d^-1 * c^-1 * b^-1
-      Subexpression: d * b
-      In: commutator=ide<->comm.1 p
-    ```
-
-    Read that as **"my step does not span a chain position"**, never as "the term is absent". (Same read-as-contradiction shape as failure modes 15 and 18, different cause.) A raw `equation.group {p}` usually fails this way, and the hypothesis merely sitting in the context is ignored outright (`Cannot solve equation`, with `Reduced to:` repeating `Equation:` verbatim).
-
-    **When one step genuinely cannot bridge**, use a pivot: an unconditional `equation.*` restating one side so the hypothesis's LHS surfaces, then `rewrite`/`pmap` with it, then a second solver call. You need this exactly when the relation must be applied at two *interior* positions — decidable in advance, not by trial: compute `RHS⁻¹ · LHS` in the free group and test whether it is a conjugate of the hypothesis's word. If its cyclically reduced length exceeds the hypothesis word's, one step cannot do it. The two live instances are `Algebra/Group.ard:commutator_commutator-right` and `:commutator_conjugate-comm`.
-
-    Two habits that paid off around this:
-
-    - **Find pivots and check statements out of band.** A 20-line free-group reduced-word checker (stack-based cancellation over `[(gen, sign)]`) decides candidate pivots and conjugacy instantly; guessing against `arend` costs a round each and the failures are uninformative. It is also what caught that a *stated* identity was false: `arend-formalization.md`'s proposed Hall–Witt identity does not hold in arend-lib's conventions (`commutator g h = g h g⁻¹ h⁻¹`, `conjugate g h = g h g⁻¹`); the correct cyclic form `commutator (commutator a b) (conjugate b c) * commutator (commutator b c) (conjugate c a) * commutator (commutator c a) (conjugate a b) = ide` is a one-line `equation.group`. For *conditional* identities, where a free-group check does not apply, sampling in `S6` is the cheap second opinion.
-    - **Name a flipped hypothesis rather than inlining it.** `comm_sym {g h} (p : commutator g h = ide) : commutator h g = ide => equation.group {pmap inverse p}` is used three times in one 60-line diff.
-
-21. **A `C.member` call whose receiver is a *computed* value needs the instance pinned, and the diagnostic names neither the instance nor the call.** `\this` of a `C.member` application is an ordinary metavariable, not an instance-search goal, so when the intended receiver is a `\func` result (`normalClosure R`, `KernelGroup f`) rather than a declared `\instance`, nothing solves it. Instead of "instance could not be inferred" you get two or three `Cannot solve equation` lines whose two sides are unrelated fragments, then a `Type mismatch` that prints the *argument's* type where an *element* belongs:
-
-        [ERROR] Cannot solve equation
-          1st expression: \Set0
-          2nd expression: E
-          In: quotHom_=1
-        [ERROR] Cannot solve equation
-          1st expression: TruncP
-          2nd expression: contains
-          In: quotHom_=1
-        [ERROR] Type mismatch
-          Expected type: in~ {w} w = ide
-            Actual type: in~ {\Sigma (n : Nat) (contains w)} (\Sigma (n : Nat) (contains w)) = ide
-
-    The fix is one implicit: `NormalSubGroup.quotHom_=1 {normalClosure R} (…)`. **Read `\Set0` vs `E`, or `TruncP` vs `contains`, as "the receiver is unsolved"** — those pairs are a class's field types escaping into unification, not a real type error. Verified 2026-09-14 on `Algebra/Group/Presentation.ard`; the same shape appears for `quot-univ` and `quotHom-eq`. Contrast **arend-quirks** §4's numeral note, where the receiver *is* an instance-search goal and the compiler does say `Cannot infer an instance of class 'Pointed' …`.
-
-22. **A `Comp G F` makes an implicit ambiguous, Arend picks the wrong reading, and the error names two index categories instead.** When a lemma's implicit `{H : Functor J SetCat}` and `{j : J}` have to be read off an element `a : G (F j)`, two solutions unify: `H := Comp G F, j := j` (intended) and `H := G, j := F j`. Arend commits to the second, and the report is a pair of `Cannot solve equation` lines naming the two *categories* plus a mismatch that prints `G.Func` where `(Comp G F).Func` belongs:
-
-        [ERROR] Cannot solve equation
-          1st expression: K
-          2nd expression: J
-          In: inC-eq
-        [ERROR] Type mismatch
-          Expected type: G.Func {j} {j4} (z J.∘ x J.∘ u1) ?a = ?a'
-            Actual type: Func {j} {j4} (z J.∘ x J.∘ u1) a = Func {j'} {j4} (z J.∘ y J.∘ u2) a'
-
-    The tell is `?a`/`?a'` still unsolved next to a *solved-looking* `G.Func`: the functor was guessed before the element. Pinning the whole implicit prefix fixes it — `SetColimit.inC-eq {J} {Comp G F} {j} {j'} {j4} {a} {a'} f g eq`. An ascribed `\have`/`\let` on the equality argument alone is *not* enough (the ascription pins the argument's type, not the lemma's `{H}`), which is the one case where the load-bearing-ascription trick under *Workflow and language gotchas* does not apply. Verified 2026-09-15 on `Category/Cofinal.ard`; expect it wherever `Comp` of `Yoneda`/`const`/diagram functors meets a lemma about `SetColimit`.
-
-23. **A missing `\import Relation.Equivalence` makes `ext` report `\Pi (i : I) -> ?A i`.** `in~`
-    is `Quotient`'s constructor and lives in `Relation.Equivalence` — not in `Logic`, not in
-    `Set.SetCategory`, and not pulled in by importing the module that defines the quotient you are
-    matching on. Without it, `ext \case \elim __ \with { | in~ _ => idp }` over a `SetColimit`
-    gives two errors:
-
-        [ERROR] Cannot find a reference to constructor among provided patterns
-          In: in~ _
-        [ERROR] Type mismatch
-          Expected type: \Pi (i : I) -> ?A i
-            Actual type: \Pi (s : SetColimit …) -> … = …
-
-    The second is the loud one, and it is a lie: `ext` *did* know the goal (checking with `{?}` in
-    place of the `\case` shows the funext goal), but its argument failed to elaborate, so it fell
-    back to `path` with an unknown family. Symptoms that this is the missing import rather than an
-    inference problem: the printed *actual* type is exactly the funext statement you intended, and
-    `ext \lam x => {?}` alone typechecks. Do not spend rounds on `later $`, type ascriptions or
-    `\have`-binding the other argument (all three were tried; none is the issue). Verified
-    2026-09-17.
-
-24. **`cong` can exhaust the JVM stack rather than fail.** On a goal whose sides are large
-    (`f * g = f' * g'` in a group of generalized elements of a pro-object), `cong` — with the
-    component paths supplied via `using (…)` — dies in
-    `org.arend.lib.meta.closure.CongruenceClosure.varHashCode` with a `StackOverflowError`, and
-    the module reports nothing else. Replace it with an explicit `pmap2 ((*) {inst}) p q`.
-    Two notes on that replacement: the instance must be pinned when the carrier's `Monoid` is a
-    `\func` result (`homGroup …` is not an `\instance`, so search finds nothing), and the operator
-    needs parentheses — `Monoid.* {inst} f g` parses as a right *section* and reports
-    `Expression is applied to an argument, but does not have a function type / Argument: g / In: f`,
-    naming the operands instead of the operator. Verified 2026-09-17.
-
-25. **`equation.cRing` treats `pow t (a + b)` as an atom, and `repeat` does not stop at the first
-    failed `rewrite`.** A polynomial identity whose powers have *variable sum* exponents fails with
-    `Cannot solve equation`, and the `where` list shows atoms like `pow {R} t (s + j)`. Split them
-    first with an explicit tuple, `rewrite (Monoid.pow_+ {R}, Monoid.pow_+ {R}, …) equation.cRing`:
-    each entry splits *one* sum node, and all occurrences of the instance it matched. You need
-    exactly as many entries as there are distinct sum nodes. Too few leaves compound atoms in the
-    `where` list (add one per leftover); too many reports `Cannot find subexpression`.
-    `repeat {n} (rewrite (Monoid.pow_+ {R})) e` does **not** work as "until no match": it applies
-    `n` times and fails, with a spray of `Type mismatch / Expected type: a pi type`. Also convert
-    integer multiples before the solver: `k *i x = (k *i ide) * x` (`*i_*-left` with `ide`), with
-    each `x` given explicitly in a `rewrite`. The pattern `k *i ?x` would re-match the `k *i ide`
-    it just produced. Verified 2026-10-15 on `pz-lem` / `decNat-lem` in the thesis repo's
-    `src/Steinberg/PatchingProof.ard` (19 and 22 splits).
-
-26. **Elaboration time is dominated by inference, not by the proof — pin to cut minutes to seconds.**
-    Measured on the pro-level P6/P7 work (2026-10-16), each a 30× to 100× speed-up:
-    - **Lemma calls inside a `\cowith` record implementation**, whose arguments are values of the
-      record's own fields (`| indep r r' => rep-indep r r'` with `r : \this.Rep g n c`): inferring the
-      lemma's implicits (`{pr}`, `{c}`, …) through the field took 4 minutes; passing every implicit
-      explicitly (`rep-indep {I} {Phi} {pr} {C} {R} {t} {g} {n} {n'} {c} {c'} r r'`) took 5 seconds.
-    - **Pointwise equalities in a presented group** (`St C R`, any `PresentedGroup`): a chain whose
-      intermediate types Arend must infer unfolds `St.map` into `NormalSubGroup.quot-univ` terms.
-      Stating each step as a `\have` with an explicit type took 2.5 minutes down to 6 seconds.
-    - **A failed instance search on a quotient carrier is slow**: `conjugate-via-id` without
-      `{St C R}` spent ~3 minutes before reporting `Cannot infer an instance of class 'Group' with
-      classifying expression: Quotient …`. Pin every group operation on `St` (`(*) {St C R}`,
-      `conjugate {St C R}`, `conjugate-via-id {K} {x}`) at the first sight of such a message.
-    - **Abstract the target group**: the same construction over `{K : Group}` checks in seconds
-      where it takes 80 seconds at `K = St C R`. Prove it generically and instantiate at the end.
-    Bisect a slow definition by replacing tails of its body with `{?}`. Unchanged definitions are
-    cached per definition, so each probe costs only the edited one.
-
-### Workflow and language gotchas
-
-- **A `Termination check failed` on an obviously-decreasing recursion is usually fallout from an
-  unresolved reference four lines up.** An unresolved name in a recursive lemma's *result type*
-  leaves the recursive call's decreasing argument an unsolved metavariable, so the checker cannot
-  see the descent and reports the lemma as non-terminating — and because the termination pass runs
-  last, that bogus error is the one at the bottom of the output, right where you are looking:
-
-      [ERROR] Algebra.Monoid.SubMonoid:114:71: Cannot resolve reference '*n'
-      [ERROR] Algebra.Monoid.SubMonoid:116:16: Cannot infer parameter 'x' of definition 'contains_+'
-      [ERROR] Algebra.Monoid.SubMonoid:116:28: Cannot infer parameter 'n' of definition 'contains_*n'
-      [ERROR] Algebra.Monoid.SubMonoid:114:10: Termination check failed
-
-  Only the first line is real (here: a class `\func` member needs qualifying — **arend-quirks** §4).
-  Reordering parameters or hoisting a helper to "fix the recursion" achieves nothing. Verified
-  2026-09-14; general instance of *Chasing type errors while unresolved references remain*.
-
-- **A solver at the end of a chain inside `inv (…)` has no target.** `N-just q *> inv (pmap negative X *> equation.cRing)`
-  elaborates the inner chain first, with its right end unknown, and the solver reports a nonsense
-  `Cannot solve equation: v0 = -v0`. Move the solver to where both neighbours pin it:
-  `N-just q *> equation.cRing *> inv (pmap negative X)`. A solver *between* two concrete steps is fine.
-  Verified 2026-10-13.
-
-- **`\peval` is for `\sfunc` only.** Plain `\func`s reduce by definition; `\peval` on them errors with `Expected a function or an \scase expression`.
-
-- **`rewrite p` beats `transport (\lam x => x.<field> ...) p`.** The lambda-projection form fails on records with `Expected type: a class`. `rewrite` rewrites the goal directly without the lambda.
-
-- **A single-use `\have` whose *ascription* solves a lemma's implicits must not be inlined.** The
-  compaction list below says to inline single-use `\have` clauses; this is the exception, and it is
-  the mirror image of the usual hazard (**arend-quirks** §7, where a `\have` makes its value opaque).
-  In `Algebra/Ring/Excision.ard:interMod_pow`,
-
-  ```arend
-  \have b'=ha : b' = h * a => A.regulars-cancel (A.regulars.contains_pow hr) (inv q' *> q *> equation.cRing)
-  \in \let | (inP (b'',Bb'',q'')) => p b' Bb' a (b'=ha *> equation.cRing) \in …
-  ```
-
-  the ascription `b' = h * a` is the only thing that pins `regulars-cancel`'s `{x}` and `{y}`. Inline
-  it into its one use and both come back unsolved, as two `Cannot solve equation` lines naming the
-  *cancelled* factor rather than the missing implicit:
-
-      Cannot solve equation
-        Equation: v0 * h * a = v0 * v0
-        where v0 = pow {A} h k
-
-  Read `v0` appearing on both sides of a product as "an implicit defaulted to the wrong atom", and
-  restore the ascribed binding. Rule of thumb: a `\have` may be inlined when it only *carries* a
-  proof; keep it when its written type is the only statement of what the proof is about.
-
-- **Inference failures want explicit pinning.** For `BigSum_<=` specifically, pass the length plus both arrays: `BigSum_<= {suc n} {arr1} {arr2} (\lam k => ...)`. More generally, when a lemma call gives `Cannot infer parameter X`, annotating one or two implicits is usually enough.
-
-- **Use named primitives for sentinels.** `0 < 1` for rationals is `RatField.zro<ide`. Don't reconstruct them ad-hoc; the named form lets the elaborator unify with class instances cleanly.
-
-- **`\have | x : T => v` can make `x` opaque.** With a type annotation, later uses of `x` may not unfold to `v` during unification (`Cannot solve equation: e, x`). If unification fails on a `\have`-bound name, either drop the type annotation or inline the value directly.
-
-- **Don't over-qualify typeclass operators.** Inside expressions where both operands are typed (e.g. by surrounding `\have | x : Rat => ...` ascription), bare `+`, `*`, `<`, `<=` resolve to the right instance via type inference. `RatField.+` and `RatField.*` are usually redundant noise; reach for `Module.op` only when type inference can't pin the instance (rare). Named lemmas (`RatField.finv-left`, `RatField.zro<ide`) still need qualification because they aren't covered by the ambient `\open` set — a selective `\open RatField (finv, finv-left, ...)` shortens further if you reach for these often.
-
-- **`\private` inside a `\where` block makes the helper unreachable from sibling lemmas.** The dot-path `parent.helper` syntax works for non-private `\where` members, but `\private` blocks it. The error is misleading: `Type mismatch: Expected type: a class. Actual type: <parent's body>`. Fix: drop `\private`, or hoist the helper to file-level `\private \lemma`.
-
-- **Bridge `RealNormed.norm`-of-Rat to a pure Rat inequality** via `LatticeAbGroup.abs-ofPos` → `RealAbGroup.abs-rat` → `Real.<=-upper` → `rat_real_<=`. The chain unfolds `norm (Real.fromRat r) ≤ ExUpperReal.fromRat c` into `RatField.abs r ≤ c`. Live instances: `Arith/Log/Properties.ard:91` and `Topology/StoneCStarAlgebra.ard:251`; the shorter `norm_fromRat <=∘ ExUpperReal.<=-rat.1 …` variant is at `Arith/Trig/ArcTan.ard:95`. See **arend-quirks** §16.
-
-- **For `\have`-bindings where `\elim` or case-splitting is needed**, factor into a separate `\private \lemma` rather than embedding `\case \elim` inside the `\have`. Arend's elaborator handles the recursion-via-named-lemma cleanly; embedded `\case` inside a `\have` chain often produces confusing errors. The original example (`ratio-recip>=0` / `ratio-recip<=1` in `Arith/Trig/ArcTan.ard`, where `\elim m` was needed to force `makeRat` reduction) has since been removed from the tree; for the underlying `makeRat` non-reduction and its current fixes see **arend-quirks** §17.
-
-- **`Or` constructors `inl`/`inr` need `\import Data.Or`.** They live there, not in `Logic`. The error message (`Cannot find a reference to constructor among provided patterns`) doesn't say "missing import" — recognize the symptom.
-
-- **After creating a new module, the symbol index may lag.** `-ss` is served from a per-library on-disk index that re-parses only changed files, so a brand-new module can be missing from `-ss` / `-fu` / `-ch` results for a round. A "no match" on something you just wrote is an index artefact, not evidence the definition is broken — typecheck the module, then query again. `arend . --daemon-refresh` re-typechecks and is the direct way to force it. (The `-ai` pipeline whose stage 4 was this index rebuild is **not on the current tree** — `-ai` is not a registered option and hard-errors; see the caveat in **arend-formalize**.)
-
-- **Keep a daemon up for the whole session.** `arend . -d --serialize` once; every later call auto-routes to it. `--serialize` belongs on that bootstrap: it is a locked flag, so a daemon started without it writes no `.arc` for the whole session regardless of what served calls pass.
-
-- **If `arend` hangs or comes back with empty output, suspect the binary caches *or* the daemon.** A stale or half-written `.arc` is one cause; a wedged warm server is the other. Re-run as `arend --no-daemon -r --serialize <Module>` — that bypasses both at once (`--no-daemon` because a daemon-served `-r` is ignored, `-r` to skip cache loading) and `--serialize` replaces the caches from the clean build. If the clean run is fine but the warm one isn't, restart the daemon: `arend . --daemon-stop && arend . -d --serialize`.
-
-- **A report that looks suspiciously short is a cache or daemon symptom, not a formatting one.** If the output disagrees with what's on disk, re-run with `--no-daemon -r` and compare — a from-source, out-of-daemon pass is the authoritative second opinion. (For a pure second opinion you can leave `--serialize` off; add it only when you want the repaired cache kept.)
-
-- **`.sig/<module>.ard` — not on the current tree (verified 2026-09-10).** No source file writes a `.sig/` mirror, and the daemon's bootstrap is a plain typecheck rather than an `-ai` pipeline. *As designed*, `.sig` would hold verified-only signatures (bodies replaced by `{?}`, failures rendered as `-- skipped: <name> (typecheck errors)`) and would be the cheapest source of truth after `-ss`. Until `-ai` appears in `--help`, use `-ss` / `-ps` and read the real sources.
-
-- **`arend <Module>` from outside the library crashes with `NullPointerException: ctx.outputRouter is null`.** Run the typecheck workflows and `-ss` / `-ps` / `-fu` / `-ch` / `-sc` from inside the library directory (`cd arend-lib && arend …`).
-
-- **If `arend` throws a Java exception (stack trace, not a typecheck error), snapshot the cache state before recovering.** The current `.arc` binaries at the moment of crash are the only evidence for the serialization bug that produced them; recompiling from sources destroys that evidence. Before retrying, zip the entire arend-lib tree (sources, `bin/*.arc`, everything) to a timestamped archive outside the tree: `zip -qr /tmp/arend-lib-crash-$(date +%Y%m%d-%H%M%S).zip <path-to-arend-lib>`. Only then re-run with `arend --no-daemon -r --serialize <Module>`. Mention the archive path to the user so they can pick it up for serialization debugging.
-
----
-
-## The metas, one paragraph each
-
-### `rewrite p t` — rewrite in the goal
-
-`p : a = b`. Replace `a` by `b` in the *expected* type, then `t` proves the rewritten type. Sugar for `transportInv (\lam x => goal[a := x]) p t`.
+`rewrite (p : a = b) t : T` replaces the occurrences of `a` in `T` by a variable and returns `transportInv (\lam x => T[x/a]) p t`; `t` proves the rewritten goal. If the expected type is unknown, it rewrites in the type of `t` instead.
 
 ```arend
-\func ex (n m : Nat) (p : n = m) (q : m = 0) : n = 0 => rewrite p q
-\lemma +-assoc (a b c : Nat) : a + b + c = a + (b + c) \elim c
-  | 0 => idp
-  | suc c => rewrite (+-assoc a b c) idp
+\func rw-ex (n m : Nat) (p : n = m) (q : m = 0) : n = 0 => rewrite p q
 ```
 
 Variants:
-- `rewriteI p t` ≡ `rewrite (inv p) t` — when the equation is wrong-way-round.
-- `rewrite {n_1, n_2, ...} p t` — only the listed occurrences (1-indexed, left-to-right after each substitution). Use when the LHS appears multiple times and rewriting all chases its tail.
-- `rewrite (p_1, p_2, ..., p_n) t` — tuple form, same as nested `rewrite`s. **Combine with `equation.cRing` as a workhorse**: `rewrite (lemma1, lemma2) equation.cRing` sets up a goal for the CRing solver after applying multiple algebraic identities. In-tree examples of the tuple-then-solver shape: `Algebra/Module.ard:402` (`rewrite (i.func-+, j.func-+) equation`), `Algebra/Field/Algebraic.ard:81` (`rewrite (f.func-+, f.func-negative, f.func-*) equation`), `Algebra/Linear/Matrix.ard:423`.
-- `rewriteF p t` — forces `rewrite` to inspect the type of `t` rather than the expected type. Use when the LHS is missing from the goal but present in `t`'s type.
-- `rewriteEq p t` — `rewrite` for subexpressions equal up to monoid/category laws (associativity, identity). Useful when `rewrite` can't see a syntactic match because of a different parenthesization.
+- `rewriteI p t` ≡ `rewrite (inv p) t`.
+- `rewrite {i_1, …} p t` — only the listed occurrences (1-indexed, counted after the previous replacements).
+- `rewrite (p_1, …, p_n) t` ≡ `rewrite p_1 (… (rewrite p_n t))`. With a solver as `t` this is the workhorse: `rewrite (l1, l2) equation`.
+- `p` may be a function: `rewrite p` is `rewrite (p _ … _)`. So **declare rewriting lemmas with implicit arguments** — `rewrite lemma` then works bare, instead of a motive plus spelled-out arguments.
+- `rewriteEq p t` (`Algebra.Meta`) — matches subexpressions equal up to monoid/category laws (associativity, identities) when the parenthesization differs.
 
-### `run { f_1, f_2, ..., f_n, t }` — chain unary functions
+Pitfalls:
 
-Expands to `f_1 (f_2 (... (f_n t)))`. Last entry is the seed. Mix freely: `rewrite p`, `pmap suc`, `(p *>)`, any unary path-function.
+- **`rewrite p q` vs `rewrite p in q`.** `in` drops the expected type, so `rewrite` works on `q`'s type. If `rewrite p q` cannot find the LHS in the goal, try `rewrite p in q` (see *in / at*).
+- **The search does not evaluate.** `rewrite` will not run a definition by pattern matching to expose the LHS; unification (a `*>` chain, an argument position) does. The diagnostic prints the *normalized* goal, so it reads as a contradiction:
+
+  ```arend
+  \func dbl (n : Nat) : Nat \elim n | 0 => 0 | suc n => suc (suc (dbl n))
+  \func rd  (x : Nat) (p : suc (suc (dbl 0)) = x) : dbl 1 = x => rewrite p idp   -- fails
+  \func rd' (x : Nat) (p : suc (suc (dbl 0)) = x) : dbl 1 = x => p               -- works
+  ```
+
+      [ERROR] Cannot find subexpression
+        Subexpression: 2
+           Expression: 2 = x
+        In: rewrite
+
+  When the pattern appears only after a reduction, write the step as a chain element instead of a `rewrite`.
+- **`{?error}` inside `Subexpression:`** means the lemma's implicits were never solved, so the pattern was never built — read it as "cannot infer the implicits", not "the term is absent". Typical when the operands sit under an operation of a concrete instance that computes (see **arend-quirks**, *Concrete instances compute*). Spell the implicits (`rewrite (lemma {x} {y}) t`) or move the step into a helper whose operands are parameters.
+- **`transport (\lam x => x.f …) p t` on a record fails with `Expected type: a class`**; `rewrite p t` does the same job without the projection lambda. Keep `transport` only where the expected type is not pinned (an argument of `linarith`, one side of a chain whose middle is free).
+
+### `run { f_1, …, f_n, t }` — chain unary functions
+
+`run { e_1, …, e_n }` ≡ `e_1 $ e_2 $ … $ e_n`. **The seed is last**: `run { rewrite p, rewrite q, idp }` is `rewrite p (rewrite q idp)`.
 
 ```arend
-\func ex {A : \Type} (a b c d : A) (p : a = b) (q : b = c) (r : c = d) : a = d
+\func run-ex {A : \Type} (a b c d : A) (p : a = b) (q : b = c) (r : c = d) : a = d
   => run { rewrite p, rewrite q, rewrite r, idp }
 ```
 
-Debugging tip: replace any entry (or the seed) with `{?}` to surface the goal type at that point. The error message becomes a window into the intermediate state — useful when a chain fails halfway through and you need to know what the goal looked like before it broke.
+- **Probe:** replace any entry (or the seed) with `{?}` to see the goal at that point.
+- **`later $`:** an entry that fails with an unresolved-goal error while the same meta works on its own usually needs its invocation deferred: `run { later $ rewrite p, idp }`.
+- **`\lam x,` opens a binder** and the rest of the block becomes its body:
 
-If a middle entry fails with a confusing unresolved-goal error, prefix it with `later $` (see common failure mode #9).
+  ```arend
+  \func run-lam (f g : Nat -> Nat) (p : \Pi (n : Nat) -> f n = g n) : f = g
+    => run { ext, \lam n, p n }
+  ```
+- **`\have` is an entry too**, scoping over the rest of the block:
 
-**Inside the per-x body, Arend infers most implicits.** Once you're inside an enclosing `BigSum-ext`/`FinSum-ext`'s per-index lambda, the goal type is `arr1 x = arr2 x` (both sides constrained). The intermediate types in any `*>` chain inside that body are then unifiable by Arend, so the chain steps can drop their `{...}` annotations:
+  ```arend
+  \func run-have (a b : Nat) (p : a = b) : b = a
+    => run {
+      \have | q : b = a => inv p,
+      rewrite q,
+      idp
+    }
+  ```
+
+  Worth it when what follows the rewrite is short; otherwise `\have … \in rewrite q $ …` keeps the punchline on top.
+- **Slot composers for inequality chains:** `` `<∘ q `` is `\lam h => h <∘ q` (likewise `` `<=∘ ``). Align with `rewrite`, compose through each known bound, close the slack with `linarith`: ``run { rewrite <align>, `<∘ <bound>, linarith }``.
+
+  ```arend
+  \lemma slot {a b c : Rat} (p : a < b) (q : b < c) : a < c => run { `<∘ q, p }
+  ```
+
+### `in` / `at`
+
+`f in x` ≡ `\let r => f x \in r`: `x` is checked without the expected type, so a meta looks at `x`'s type instead of the goal. Invisible for most metas; observable for `rewrite`, `simplify`, `simp_coe`, `unfold`.
 
 ```arend
--- outside per-n body: every implicit explicit
-A.FinSum-rdistr {FSeriesRing.PairsFinSet (n : Nat)}
-                {pow c n k}
-                {\lam s => a s.1 * b s.2}
-*> AbMonoid.FinSum-ext {A} {FSeriesRing.PairsFinSet (n : Nat)}
-                       {long-arr-1} {long-arr-2}
-                       (\lam s => …)
-
--- inside the per-n body (arr1 n = arr2 n constrains both ends): just the punch lines
-A.FinSum-rdistr *> AbMonoid.FinSum-ext (\lam s => …)
+\func rw-in (x y : Nat) (p : 0 = x) (q : 0 = y) : x = y => rewrite p in q   -- rewrites 0 to x in q's type
 ```
 
-This is the dominant source of compression in `LHS-eq-M`-style proofs: ~3× reduction comes not from `run`/`rewrite` itself but from this argument-elision inside the per-x bodies.
+`in` has loose precedence (right-associative, priority 1): `(simp_coe in t) b` differs from `simp_coe in t b`. `(f_1, …, f_n) in x` ≡ `f_1 in … f_n in x`.
 
-**After the first anchored step in an outer `*>` chain, later entries also drop their implicits.** Once `BigSum-ext {A} {suc k} {explicit arr1} {explicit arr2} body` pins the chain to `BigSum arr2`, subsequent entries `*> inv (A.FinSum=BigSum {suc k})`, `*> A.FinSum-double-dep (\lam n => …)`, etc. can be argument-stripped — Arend recovers them from the previous step's output type. Keep explicit only what Arend genuinely can't recover:
-
-- FinSet labels for SigmaFin variants (`{LHS-tri-fin k}` vs. `{LHS-rect-fin k}` — Arend can't decide between equivalent SigmaFin's).
-- The dependent inner family of `FinSum-double-dep` (`(\lam n => PairsFinSet (n : Nat))`) — Arend can't guess that.
-- The very first chain step's arrays (anchor for everything downstream).
-
-If you find yourself writing arrays at the 3rd or 4th `*>` entry, suspect they can be elided. Test by deleting one at a time.
-
-**`\lam x,` opens a binder inside `run`.** When a `run` entry expects a `\Pi (x : T) -> ...` argument (e.g. the per-index proof of `BigSum-ext`, or any partially-applied combinator), use `\lam x,` and the *rest of the `run` block* becomes that lambda's body. So
+`(f at h) body` replaces the binding `h` by `f h` for the rest of `body`; it works on parameters and on `\let` / `\have` bindings. Equivalent forms:
 
 ```arend
-run { ..., BigSum-ext {l} {l'}, \lam i, rewrite p, rewrite q, idp }
+\func at-ex  (n m : Nat) (p : n = m) (q : n = 0) : m = 0 => rewrite p at q $ q
+\func at-ex2 (n m : Nat) (p : n = m) (q : n = 0) : m = 0 => run { rewrite p at q, q }
 ```
 
-is equivalent to
+`(f_1, f_2) at h` ≡ `f_1 (f_2 h)`.
+
+### `cases` — multi-scrutinee `\case`
+
+`cases (e_1, …, e_n) \with { … }` avoids `\case` boilerplate. `arg addPath` adds the equation between the scrutinee and the matched pattern — `cases (e arg addPath)` ≡ `cases (e arg (name = x), idp : e = x)` — and rewrites the dependent return type:
 
 ```arend
-... *> BigSum-ext {l} {l'} (\lam i => rewrite p (rewrite q idp))
-```
-
-This is the workhorse pattern for finite-sum proofs.
-
-**Slot-notation composers for inequality chains.** `` \`<∘ <strict-bound> `` is `\lam h => h <∘ <strict-bound>` — a partially-applied composer. Used in a `run` block, it collapses `<∘`-chained inequalities:
-
-```arend
-real_<_U.1 (run {
-  rewrite y-eq,             -- align goal
-  `<∘ (real_<_U.2 q.3),     -- compose with strict bound
-  linarith                   -- close residual
-})
-```
-
-The general shape is: align the goal with `rewrite`, compose forward through each known bound with `` `<∘ `` / `` `<=∘ ``, then let `linarith` close whatever numeric slack is left. Reach for it whenever a proof would otherwise name five intermediate inequalities.
-
-### `f in x` — apply `f` to `x`, dropping the expected type
-
-`\let r => f x \in r`, with `\let` typechecked without goal-type info. Mostly invisible — except for `rewrite`, which depends on the expected type. Use `f in x` when the meta should look at `x`'s type instead.
-
-```arend
-\func ex (x y : Nat) (p : zero = x) (q : zero = y) : x = y
-  => rewrite p in q   -- rewrites zero -> x in q's type
-```
-
-`in` has loose precedence (priority 1, right-assoc). To apply `f in x` to more args: parenthesize. `(simp_coe in t) b` differs from `simp_coe in t b`.
-
-### `f at h` — modify a local binding
-
-Shadows `h` with `f h` for the rest of the expression. Three equivalent forms:
-
-```arend
-(rewrite p at q) (\case q \with {})
-rewrite p at q $ \case q \with {}
-run { rewrite p at q, \case q \with {} }
-```
-
-Tuple form: `(f1, f2) at h` ≡ `f1 (f2 h)` (each step applied in order, type stripped). Works on parameters, `\let`-, and `\have`-bindings.
-
-### `cases (e_1, ..., e_n) \with { ... }` — multi-scrutinee `\case`
-
-Avoids `\case e_1, e_2 \with` boilerplate. With `arg addPath`, also adds an `idp`-equality between the scrutinee and the matched pattern, and rewrites the dependent return type automatically:
-
-```arend
-\func baz {A : \Type} (B : Bool -> \Type) (p : A -> Bool) (a : A)
-          (pt : B true) (pf : B false) : B (p a)
+\func baz {A : \Type} (B : Bool -> \Type) (p : A -> Bool) (a : A) (pt : B true) (pf : B false) : B (p a)
   => cases (p a arg addPath) \with {
-    | true,  q => pt
+    | true, q => pt
     | false, q => pf
   }
 ```
 
-### `mcases {f}` — match the `\case` already in the goal
+(`Bool` is in `Data.Bool`.) Other `arg` parameters: `name`, `as`.
 
-When the expected type contains `f n` and `f` is itself defined by `\case`, `mcases {f}` builds a `\case` that mirrors `f`'s clauses:
+### `mcases` — split along a definition's clauses
+
+`mcases {f}` finds the invocations of `f` in the goal and splits along `f`'s own clauses. `f` must be defined by pattern matching:
 
 ```arend
-\func test-f (n : Nat) : f n = 5 => mcases {f} \with { | 0 => idp | suc _ => idp }
+\func felim (n : Nat) : Nat \elim n | 0 => 5 | suc _ => 5
+\func mcases-ex (n : Nat) : felim n = 5 => mcases {felim} \with { | 0 => idp | suc _ => idp }
 ```
 
-Variants:
-- `mcases \with { ... }` — finds `\case`-expressions (no `f` to point at).
-- `mcases {(f, k)}` — only the k-th occurrence of `f` (1-indexed).
-- `mcases {f, g}` — multiple definitions at once.
+For a function whose body is a `\case`, `mcases {f}` reports `Expected a function defined by pattern matching`. Plain `mcases \with { … }` matches `\case` expressions written literally in the goal — a call of a `\case`-bodied function is not one (`Cannot find matching subexpressions`). Variants: `mcases {(f, k)}` (only the k-th occurrence), `mcases {f, g}`. `mcases \with { … }` also replaces a hand-written `\case d \as d \return … \with { … }` motive.
 
 ### `simplify` — algebraic normalizer
 
-Strips `ide`, double inverses, `zro`-like absorbing elements. Inspects the in-scope `Monoid`/`Group`/`Ring`/`Semiring` instance.
+Removes identity elements, double inverses and zeros using the instance of the goal (`Monoid`, `Group`, `Ring`, …). `simplify in h` works on a hypothesis.
 
 ```arend
-\func ex {M : Monoid} (x : M) : x = x * ide => simplify
-\func neg {R : Ring} (x : R) : negative (negative x) = x => simplify
+\func simp-ex {M : Monoid} (x : M) : x = x * ide => simplify
+\func simp-neg {R : Ring} (x : R) : negative (negative x) = x => simplify
 ```
 
-`simplify in h` rewrites a hypothesis. **Does not** know commutativity or distribution. **Can fail** on goals that *should* normalize — when this happens, fall back to `equation` or manual `rewrite`.
+It is **not a decision procedure**: no commutativity, no distribution. On `x * y = y * x` in a `CMonoid` it reports `Nothing to simplify` followed by `Expressions are not equal` / `Left: x M.* y` / `Right: y M.* x`; other failures say `Meta 'simplify' failed`. Don't retry — switch to `equation`, or one `rewrite` to align the sides and then `simplify`. For component identities of a concrete record (`0 * 0 + 0 * 0 = 0`, `0 + x = x` on a named instance) `simplify` is the right tool and reads better than a solver.
 
-**Try `simplify` before `equation.cRing` for concrete-record component identities.** Goals like `0 * 0 + 0 * 0 = 0` over a concrete `Complex`, or `0 + x = x` on a named instance, dispatch with `simplify` more cleanly than with `equation` (which over-fires the ring solver and reports `Ring solver failed` if `*-comm` is needed but absent). The 2026-05-15 arend-lib refactor replaced ~10 calls of `=> equation` with `=> simplify` for `cabs2_zro`, `cabs2_ide`, `cabs2_negative`, `cabs2_i`, and similar — `simplify` is both shorter and a more accurate description of what the proof is doing.
+### `equation` — chained equality and the ring/group solvers
 
-### `equation a_1 ... a_n` — chained equality, steps inferred
-
-Proves `a_0 = a_{n+1}` via the intermediates. Each step proof is searched in the local context; if not found, supply it as an implicit.
+`equation a_1 … a_n` proves `a_0 = a_{n+1}` through the listed intermediate terms. A step's proof is found in the context, supplied in `{…}`, or left to the solver:
 
 ```arend
-\func ex {M : Monoid} (x y z : M) (p : x = y) (q : y = z) : x = z
-  => equation x y z
+\func eq-ex {M : Monoid} (x y z : M) (p : x = y) (q : y = z) : x = z => equation x y z
 ```
 
-Use `equation` when step proofs are uninteresting. Use `==<` / `>==` / `qed` when each step deserves a name in the proof body.
+Use `==<` / `>==` / `qed` (from `Paths`) instead when each step deserves to be read. A context equation is used only as a whole step, never inside one — with `p : g = h` in scope, `g * g = h * h` fails:
 
-**`equation` defaults to the non-commutative ring solver.** If your identity needs `*`-commutativity, plain `equation` will fail with `Ring solver failed`, and the printout shows the two sides differing only by argument order (e.g. `v0*v1*v2` vs `v2*v0*v1`). Use the variant matching your structure:
+    Cannot solve equation
+      Equation: g * g = h * h
+      Reduced to: g * g = h * h
+      In: group
 
-- `equation.cRing` — commutative rings (`Rat`, `Real`, etc.).
-- `equation.cMonoid` — commutative monoids (no addition involved).
-- `equation.monoid` — non-commutative monoids.
+**Solver choice.** Plain `equation` picks the solver from the structure it finds: over `{R : CRing}`, `Rat` or `Real` it proves `x * y = y * x` as is. `equation.cRing`, `equation.cMonoid`, `equation.monoid`, `equation.group` force one. `Ring solver failed` with two sides that differ only in factor order means the instance found is non-commutative:
 
-Existing arend-lib calls (`Algebra/Ring/Localization.ard`, `Algebra/Linear/Matrix.ard`) already pick the correct variant — but `equation` alone is the wrong default for ordered-field arithmetic and the failure message doesn't directly suggest the fix.
+    Ring solver failed
+      Equation: v0 * v1 = v1 * v0
+      where
+        v0 = x
+        v1 = y
 
-**`equation.group` decides group identities, and `{...}` is how you feed it a hypothesis — but the entries are *chain steps*, not assumptions.** The group solver closes any identity that is a word equation in the free group — the full Hall–Witt identity included. **That is also a reason not to state such an identity as a lemma at all:** `Algebra/Group.ard` briefly carried eight unconditional `commutator`/`conjugate` identities and they were deleted again on 2026-09-14, since `equation.group` at the call site is shorter than the name of the lemma proving it. Keep the *conditional* ones, where the bridge below is the content. For a *conditional* identity, `{...}` takes a list of **chain step proofs** — each must bridge two consecutive chain terms, and the solver normalises the gaps shut. With no explicit intermediate terms there is one chain position, so a lone entry must bridge the whole goal. The consequence in practice: **`pmap` the hypothesis into a whole-side bridge and hand that over.**
+— check the class the statement quantifies over (`{R : Ring}` here).
+
+**There is no commutative-rng solver.** At `{R : PseudoCRing}` (no `ide`) plain `equation` falls back to the monoid solver and loses both commutativity and distribution — the tell is the solver's name, `Monoid solver failed`, on sides that differ by order or one distribution step. `equation.cRing` there gives `Cannot infer an instance of class 'CRing' with classifying expression: R.E`. Write the chain by hand (`pmap (* z) *-assoc *> *-assoc` and friends) or keep the unital hypothesis.
+
+**What the solver treats as atoms.**
+- `pow t (a + b)` with a variable exponent sum:
+
+      Ring solver failed
+        Equation: v0 = v1 * v2
+        where
+          v0 = pow {R} t (a + b)
+
+  Split first: `rewrite Monoid.pow_+ equation`. Each tuple entry of `rewrite (Monoid.pow_+, Monoid.pow_+, …)` splits one distinct sum node (all its occurrences); too few leave compound atoms in the `where` list, too many report `Cannot find subexpression`.
+- Operations of a concrete record that compute (a component formula): the solver normalizes into components and fails. State the step over an abstract class and instantiate — see **arend-quirks**, *Concrete instances compute*.
+
+**`equation.group` and hypotheses.** The group solver decides every identity of the free group — so an *unconditional* group identity needs no lemma: call `equation.group` at the use site. For a *conditional* identity, the `{…}` entries are **proofs of chain steps**, each bridging two consecutive terms; the solver closes the gaps. With no intermediate terms there is a single step, so the one entry must bridge the whole goal. `pmap` the hypothesis into such a bridge:
 
 ```arend
--- p : commutator g h = ide
-=> equation.group {pmap (* (h * g)) p}   -- proves  g * h = h * g
-=> equation.group {pmap (* h) p}         -- proves  conjugate g h = h
-=> equation.group {pmap inverse p}       -- proves  commutator h g = ide
+\lemma grp-1 {E : Group} {g h : E} (p : commutator g h = ide) : conjugate g h = h => equation.group {pmap (* h) p}
+\lemma grp-2 {E : Group} {g h : E} (p : commutator g h = ide) : g * h = h * g => equation.group {pmap (* (h * g)) p}
+\lemma grp-3 {E : Group} {g h : E} (p : commutator g h = ide) : commutator h g = ide => equation.group {pmap inverse p}
 ```
 
-What does *not* work, and is worth recognising fast: a **raw** hypothesis (`equation.group {p}`) unless it happens to bridge, and the hypothesis merely **in the local context** — no `equation.*` solver reads context equations, not even `p : g = h` for the goal `g * g = h * h`. See failure mode 20 for the diagnostic and for the goals that stay out of reach.
+Ask "what context turns `p`'s two sides into my two sides" and `pmap` that context. A raw `equation.group {p}` that does not bridge gets a misleading report — the *normalized* expected type next to a search for the hypothesis's side:
+
+    Cannot find subexpression
+      Expected type: g * h * g^-1 = h
+      Subexpression: g * h * g^-1 * h^-1
+      In: p
+
+Read it as "my step does not span a chain position", never as "the term is absent". When no single step can bridge (the relation has to be applied at two interior positions), use a pivot: an unconditional `equation.group` restating one side so the hypothesis's side surfaces, then `rewrite`/`pmap` with the hypothesis, then a second solver call. Whether one step suffices is decidable in advance: compute `RHS⁻¹ · LHS` in the free group and test whether it is a conjugate of the hypothesis's word. A 20-line reduced-word checker (stack-based cancellation over `[(generator, sign)]`) decides pivots and checks that a stated identity is true at all — far cheaper than guessing against the typechecker; for conditional identities, evaluating in a small permutation group is a cheap sanity check. Name a flipped hypothesis (`commutator h g = ide` from `commutator g h = ide`) rather than re-deriving it inline.
 
 ### `cong` — congruence closure
 
-Solves `f x_1 ... x_n = f y_1 ... y_n` given the equalities `x_i = y_i` somewhere in scope. Multi-argument generalization of `pmap`. Note: target type lives in `\Type`, so use `\func` (not `\lemma`).
+Proves `f x_1 … x_n = f y_1 … y_n` from equalities `x_i = y_i` in scope (pass extra ones with `using (…)`). Multi-argument `pmap`. The goal usually lives in `\Type`, so use `\func`, not `\lemma`.
 
 ```arend
-\func ex {A B : \Type} (f : A -> A -> B) (x x' y y' : A) (p : x = x') (q : y = y')
-       : f x y = f x' y' => cong
+\func cong-ex {A B : \Type} (f : A -> A -> B) (x x' y y' : A) (p : x = x') (q : y = y') : f x y = f x' y' => cong
 ```
 
-### `ext` — extensionality (polymorphic)
+If it fails on something obvious, check the needed `x_i = y_i` is directly in the context (not inside a `\Sigma` or under another name).
 
-| Goal shape | Subgoal |
+### `ext` — extensionality
+
+| Goal | Subgoal (the argument's type) |
 |---|---|
-| `f = g` for `f, g : \Pi (x : A) -> B x` | `\Pi (x : A) -> f x = g x` |
-| `t = s` for `\Sigma A B` (or record) | `\Sigma (h_1 : t.1 = s.1) ... ` (with `coe` corrections for dependents) |
-| `A = B` for `A, B : \Prop` | `\Sigma (A -> B) (B -> A)` |
-| `A = B` for `A, B : \Type` | `Equiv {A} {B}` |
-| `x = y` with target in `\Prop` | *no subgoal* — meta closes it |
+| `f = g` for functions | `\Pi (x_1 : A_1) … -> f x_1 … = g x_1 …` |
+| `t = s` for a `\Sigma` or a record | `\Sigma (p_1 : t.1 = s.1) …` (with `coe` corrections for dependent fields; `\Prop` fields omitted) |
+| `A = B` for `A B : \Prop` | `\Sigma (A -> B) (B -> A)` |
+| `A = B` for `A B : \Type` | `QEquiv {A} {B}` |
+| `x = y` in a `\Prop` | none — `ext` closes it |
 
 ```arend
 \func fun-eq (f g : Nat -> Nat) (h : \Pi (n : Nat) -> f n = g n) : f = g => ext h
-\func sig-eq (p p' : \Sigma Nat Nat) (h1 : p.1 = p'.1) (h2 : p.2 = p'.2) : p = p'
-  => ext (h1, h2)
+\func sig-eq (p p' : \Sigma Nat Nat) (h1 : p.1 = p'.1) (h2 : p.2 = p'.2) : p = p' => ext (h1, h2)
 \lemma prop-eq (A B : \Prop) (f : A -> B) (g : B -> A) : A = B => ext (f, g)
 ```
 
-Record copattern form: `ext R { | f_1 => p_1 | f_2 => p_2 | ... }`.
+Record copattern form: `ext R { | f_1 => p_1 | … }`. `exts` also applies `ext`/`simp_coe` to fields. A subgoal full of `coe` means a dependent field — prove it directly or follow up with `simp_coe`.
 
-### `linarith` — Fourier–Motzkin for linear arithmetic
+**`Expected type: \Pi (i : I) -> ?A i` from `ext` is a lie.** `ext` knew the goal, but its *argument* failed to elaborate and it fell back to `path` with an unknown family. The tell: the printed actual type is exactly the statement you intended, and `ext \lam x => {?}` alone typechecks. A frequent cause is a missing import inside the argument — `ext \case \elim __ \with { | in~ _ => idp }` without `Relation.Equivalence` also reports `Cannot find a reference to constructor among provided patterns`. Don't spend rounds on `later $`, ascriptions or `\have`-binding the argument.
 
-Dispatches on the in-scope `LinearlyOrderedSemiring` / `OrderedRing` instance. Reads hypotheses from the context automatically — you don't pass them explicitly when they're already named in scope.
+### `linarith` — linear arithmetic
 
-```arend
-\lemma nat-1 {a b : Nat} : 0 <= a Nat.+ b => linarith
-\lemma combine {a b c : Nat} (p : a <= b) (q : b Nat.+ c <= a) : c = 0 => linarith
-\lemma generic {R : LinearlyOrderedSemiring} {a b c : R}
-               (p : a <= b) (q : b + c <= a) : c <= 0 => linarith
-```
-
-Out of scope: products of variables, exponentiation, anything nonlinear.
-
-**Over `Real`, `\import Arith.Real.Field` is enough** (since commit `ab3dc1dba`). `linarith` resolves the `LinearlyOrderedSemiring Real` instance through the `solveEquationsFor` inference push, with or without `\open RealField`, and with or without multiple `linarith` calls in the same file. If you still see `Cannot infer an instance of class 'LinearlyOrderedSemiring' with classifying expression: Real`, check the import is actually present.
-
-**`equation.cRing` vs `linarith` — pick the right tool.** `linarith` is for *linear* (in)equalities; `equation.cRing` is the commutative-ring identity solver. A goal like `(A - B) - (A + B) = negative (2 * S * S')` is linear in atoms `A`, `B`, `S*S'`, but `linarith` can't normalize `natCoef 2` against literal `2`, and can't push `negative (...)` through the right slot — `equation.cRing` handles it instantly. The diagnostic to switch is: if `linarith` complains "Cannot solve the equation" and prints two algebraically-equivalent sides, you're in the ring-identity case, not the linear-(in)equality case. Reach for `equation.cRing`.
-
-`linarith` does not need redundant context hints. `linarith delta_min>0 : T` and `linarith : T` close the same goal when `delta_min>0` is named in scope. The explicit-hint form is for when the hypothesis isn't visible (deep inside a `\let` that shadows it). Strip the hint on the final pass.
-
-### `simp_coe` — push `coe`/`transport` through structure
-
-For accumulated `coe`/`transport` over Π, Σ, or records. Most useful in HIT-heavy Part II proofs. Niche; reach for it only when the goal is `coe`-ridden.
-
-### `unfold (f, g, ...) e` — unfold definitions in the expected type
-
-Before checking `e`, unfold the listed definitions in the goal. Tuple form runs through them left-to-right. Single-name form `unfold f e` works without parens.
-
-**Unfold minimally.** A `\func f` already reduces definitionally during elaboration, so `unfold f` is only needed when Arend's elaborator doesn't see through `f` on its own — usually when the goal involves *projections* from `f`'s result, or when `f`'s body matters for unifying a `rewrite`/`pmap` match. Example: `unfold (LHS-y, LHS-f)` got trimmed to `unfold LHS-f` because the goal mentioned `(LHS-f x).1` and `(LHS-f x).2`, which Arend couldn't reduce through; the surrounding `LHS-y` reduced on its own. Try dropping each `unfold` argument and see what fails — leftover entries earn their keep.
+Fourier–Motzkin over the goal's `LinearlyOrderedSemiring` / `OrderedRing` instance. Reads hypotheses from the context; you don't pass them.
 
 ```arend
-\func sq (n : Nat) => n * n
-\lemma ex (n : Nat) : sq n = n * n => unfold sq idp
+\lemma lin-1 {a b : Nat} : 0 <= a + b => linarith
+\lemma lin-2 {a b c : Nat} (p : a <= b) (q : b + c <= a) : c = 0 => linarith
+\lemma lin-3 {R : LinearlyOrderedSemiring} {a b c : R} (p : a <= b) (q : b + c <= a) : c <= 0 => linarith
 ```
 
-`unfold_let e` does the same for `\let`-bindings in scope. Use when the goal references a `\let`-bound name and you want it expanded before further work.
+The instance comes with the carrier's module: `Arith.Nat` (plus `Order.PartialOrder` for `<=`), `Arith.Rat`, `Arith.Real.Field`; no `\open` is needed. `Cannot infer an instance of class 'LinearlyOrderedSemiring'` means that import is missing or a local class shadows the library's.
 
-### `assumption` — fill from the local context
+What it does not see:
 
-Looks up the goal type among the in-scope hypotheses, latest binding first, and uses the first match. `assumption {n}` skips the first `n` matches (1-indexed). Useful in `\case` arms where the right witness is already in scope under some name you don't want to hunt for.
+- **Nonlinear terms are atoms, and a product with a sum factor is not expanded:**
 
-### `using (e_1, ..., e_n) e` — scope control around a sub-term
+      Cannot solve the equation
+        Equation: a * b + a <= c
+        Assumptions: a * (b + ide) <= c
 
-- `using (e_1, ..., e_n) body` — typechecks `body` with `e_1, ..., e_n` added to the local context (as anonymous `\have`s). Lets you make a derived fact visible only inside one expression.
-- `usingOnly (e_1, ..., e_n) body` — like `using`, but *replaces* the visible context with just those entries. Forces metas like `assumption`, `linarith`, `cong` to look only at the listed facts. Helpful when too many irrelevant hypotheses are confusing a search-based meta.
-- `hiding (e_1, ..., e_n) body` — typechecks `body` with the listed names removed from scope.
+  Restate such hypotheses in distributed form and bridge with `=_<= equation` (or `<∘l` / `=_<=` combinations when both sides need reshaping).
+- **Factor order matters**: `a * b` and `b * a` are different atoms (`Equation: b * a <= c` / `Assumptions: a * b <= c` fails). Normalize the order by hand in every hypothesis and the goal; nothing in the output points at this.
+- **A `\func` constant whose value does not compute to a literal is an atom.** Over `Real`, `\func third : Real => ratio 1 3` makes even `third > 0` fail (`Equation: zro < third` / `Assumptions:`). A `\meta` is substituted syntactically, so the solver sees the literal — ascribe its body, or it elaborates as a `Rat` wherever nothing else pins the type:
 
-### `$` / `#` — application operators that respect implicit args
+  ```arend
+  \meta third => (ratio 1 3 : Real)
+  \lemma third>0 : third > 0 => linarith
+  ```
 
-From `Function.Meta`. Behave like Haskell's `$` but participate in implicit-argument inference and section syntax.
+  A *parameterised* `\func` stays folded by design (its lemmas are its interface): restate the goal with the body spelled out and convert at the end with `=_<= equation`.
+- **Too many hypotheses**: past ~20 it starts failing on goals it can do, and unrelated facts print with unresolved metas. `usingOnly (h_1, …, h_k) linarith` restricts the context and makes failures readable:
 
-- `f $ x` — right-associative, low priority. `f $ g $ x` ≡ `f (g x)`. Avoids parens around long argument expressions.
-- `x # f` — left-associative dual. `x # f # g` ≡ `g (f x)`. Good for "pipe" reading.
-- `__ $ a` — section with the implicit-lambda placeholder `__`. `__ $ a` ≡ `\lam f => f a`.
+  ```arend
+  \lemma lin-4 {a b c : Nat} (p : a <= b) (q : b + c <= a) (r : 5 <= 7) : c = 0 => usingOnly (p, q) linarith
+  ```
+- **Polynomial identities are `equation`'s job.** If `linarith` prints `Cannot solve the equation` with two algebraically equal sides (often differing by `natCoef 2` vs `2`, or by where a `negative` sits), switch to `equation`. `linarith` is for numeric (in)equalities; they don't substitute for each other.
+Hints such as `linarith h` are unnecessary when `h` is in scope (only when it is hidden, e.g. shadowed in a `\let`); strip them on the final pass.
 
-### `later meta args` — defer a meta invocation
+### `simp_coe` — push `coe` / `transport` through structure
 
-From `Meta`. Postpones the elaboration of `meta args` until the surrounding type-inference has made more progress. Most often used as `later $ rewrite p`, `later $ simplify`, etc., inside a `run` block where the intermediate expected type isn't yet pinned down. If a meta in the middle of a chain fails with "cannot infer expected type" or similar, `later` is the first thing to try — see common failure mode #9.
+For goals full of `coe`/`transport` over `\Pi`, `\Sigma` or records (common with HITs). Niche; reach for it only when the goal is `coe`-ridden.
 
-### `repeat f x` — iterate a meta to fixpoint
+### `unfold`, `unfold_let`, `unfolds`
 
-Applies the unary meta `f` to `x` until the result stops changing. `repeat {n} f x` caps at `n` iterations. Mostly used as `repeat (rewrite p) t` or `repeat unfold_let t`.
+`unfold (f_1, …, f_n) e` unfolds the listed functions/fields/variables in the expected type before checking `e` (in `e`'s type if the expected type is unknown); `unfold f e` for one. `unfold_let` expands `\let`s, `unfolds` unfolds top-level functions and fields recursively. A `\func` already reduces during unification, so `unfold` is needed only where the elaborator does not look through `f` — projections of `f`'s result, or matching for `rewrite`/`pmap`. Unfold minimally: drop each argument and see what fails.
 
-### `defaultImpl C F E` — invoke a class's default field implementation
+### `assumption`
 
-Given class `C` with default implementation `F`, plus the explicit arguments `E` it expects, returns the default value. Use when an instance overrides a field but you want to refer to (or fall back to) the class-level default.
+Fills the goal from the context, trying later bindings first. `assumption {n}` is the n-th variable counting from the end; `assumption {n} a_1 … a_k` applies it to arguments.
+
+### `using` / `usingOnly` / `hiding`
+
+- `using (e_1, …) e` — checks `e` with the `e_i` added to the context: a derived fact visible to search-based metas in one sub-term only.
+- `usingOnly (e_1, …) e` — replaces the context by the `e_i`; use when irrelevant hypotheses confuse `linarith`, `assumption`, `cong`.
+- `hiding (x_1, …) e` — hides the listed local variables.
+
+### `$` / `#'` — application operators
+
+From `Function.Meta`; they take part in implicit-argument inference. `f $ x` is right-associative, priority 0: `f $ g $ x` ≡ `f (g x)`. `f #' x` is the left-associative version: `f #' x #' y` ≡ `f x y`.
+
+```arend
+\func app-ex (f g : Nat -> Nat) (x : Nat) : f (g x) = (f $ g $ x) => idp
+\func app2-ex (f : Nat -> Nat -> Nat) (x y : Nat) : f x y = (f #' x #' y) => idp
+```
+
+### `later`
+
+`later meta args` defers the invocation until type inference has made more progress — the first thing to try when a meta inside a `run` chain fails with an unresolved expected type: `run { later $ rewrite p, idp }`.
+
+### `repeat`
+
+`repeat {n} f x` applies `f` exactly `n` times — it fails if any application fails, often as a spray of `Type mismatch` / `Expected type: a pi type`, so it is not "until no match". `repeat f x` applies `f` until it fails. For a known number of rewrites the tuple form `rewrite (p, p, p) t` is more predictable.
+
+### `defaultImpl`
+
+`defaultImpl C F E` is the default implementation of field `F` of class `C` applied to `E` (`E` may be omitted). Use it to refer to the default from an instance that overrides the field.
+
+Other metas in `Meta`: `x <|> y` / `try` (try `x`, else `y`), `fails m` (succeeds iff `m` fails), `mkcon`.
 
 ---
 
 ## Decision table
 
-| If the goal looks like... | Reach for |
+| If the goal looks like… | Reach for |
 |---|---|
-| `f x_1 ... x_n = f y_1 ... y_n` with each `x_i = y_i` in scope | `cong` |
-| Linear (in)equality between sums/products with constants | `linarith` (over `Real`: just `\import Arith.Real.Field`) |
-| Equation between monoid/ring expressions, no commutativity needed | `simplify` |
-| Ring/field identity over `Rat`/`Real` or any commutative ring (needs `*`-commutativity) | `equation.cRing` — **plain `equation` will fail** |
-| Unconditional identity in a group (words in `*`, `inverse`, `ide`) | `equation.group` |
-| Same, but *given* an equational hypothesis `p` | `equation.group {pmap <context> p}` — shape `p` into a whole-side bridge (failure mode 20) |
-| …and no single step can bridge it (relation needed at two interior positions) | pivot identity + `rewrite`/`pmap` + second `equation.group` |
-| Symbolic identity in atoms with `negative`/`natCoef` (e.g. `(A-B) - (A+B) = -2B`) | `equation.cRing` — **`linarith` chokes on `natCoef` vs literal `2`** |
-| Identity over a commutative monoid (no addition) | `equation.cMonoid` |
-| Identity that bridges `finv` / `*-rat` / `fromRat` with CRing rearrangement | `rewrite (finv_*, inv *-rat) equation.cRing` |
-| Equation that needs a *named* sequence of intermediate steps | `equation a_1 ... a_n`, or `==<`/`>==`/`qed` |
-| Need to substitute one term in the goal | `rewrite p t` |
-| Need to substitute, but the equation is reversed | `rewriteI p t` |
-| Multiple instances of LHS, want only one | `rewrite {n} p t` |
-| Several rewrites, all in goal | `rewrite (p_1, ..., p_n) idp` |
-| Mixed chain (rewrite + pmap + sections) | `run { ..., idp }` |
-| Inequality chain (`<` / `<=`) | `run { rewrite <align>, \`<∘ <bound>, linarith }` |
-| Need to reshape a hypothesis before using it | `rewrite p at h $ body` |
-| Need to feed a hypothesis to a meta when there's no goal type | `f in h` |
-| `f = g` (functions) or tuple/record equality | `ext h` (with appropriate subgoal) |
-| Prop-irrelevance bridge `F p = F p'` from `p.1 = p'.1` | `\elim p, p', h \| ..., ..., idp => pmap2 ... prop-pi prop-pi` |
-| Goal contains a `\case` of a function I didn't write | `mcases {f}` |
-| Need to remember the scrutinee's value while pattern matching | `cases (e arg addPath)` |
-| `coe`/`transport` chains visible in the goal | `simp_coe` |
-| Goal mentions a definition I want unfolded | `unfold f body` |
-| Right witness is already in the context, just need to plug it in | `assumption` |
-| Search-based meta confused by too many hypotheses | `usingOnly (h_1, ..., h_n) body` |
-| Want one local derived fact visible inside one expression | `using (h) body` |
-| Apply a meta until it stops doing anything | `repeat f x` |
-| Long pipeline of unary functions | `f $ g $ x` or `x # f # g` |
-| Meta inside `run { ... }` fails with unresolved-goal error | Prefix it with `later $` |
-| Want to inspect intermediate goal in a `run` chain | Replace an entry with `{?}` and read the error |
+| `f x_1 … x_n = f y_1 … y_n`, each `x_i = y_i` in scope | `cong` |
+| Linear (in)equality: atoms times constants, summed, compared | `linarith` |
+| Monoid/ring expression equal up to identities, inverses, zeros | `simplify` |
+| Ring or field identity | `equation` (solver from the instance; `equation.cRing` to force) |
+| Identity once a few lemmas are applied | `rewrite (l_1, l_2) equation` |
+| Identity in a group (`*`, `inverse`, `ide`) | `equation.group` |
+| …given an equational hypothesis `p` | `equation.group {pmap <context> p}` |
+| …where no single step can bridge | pivot identity + `rewrite`/`pmap` + second `equation.group` |
+| Identity over a commutative monoid (no `+`) | `equation.cMonoid` |
+| Equality whose steps deserve names | `==<` / `>==` / `qed`, or `equation a_1 … a_n` |
+| Substitute one term in the goal | `rewrite p t` (reversed: `rewriteI p t`; one occurrence: `rewrite {k} p t`) |
+| Several substitutions, then trivial | `rewrite (p_1, …, p_n) idp` |
+| Mixed chain (rewrite + pmap + sections) | `run { …, idp }` |
+| Inequality chain (`<` / `<=`) | ``run { rewrite <align>, `<∘ <bound>, linarith }`` |
+| Reshape a hypothesis before using it | `rewrite p at h $ body` |
+| A meta should read a term's type, not the goal | `f in h` |
+| `f = g` (functions), tuple or record equality | `ext h` |
+| `F p = F p'` from `p.1 = p'.1` (proof irrelevance) | multi-`\elim` with `idp`, closing with `pmap2 … prop-pi prop-pi` |
+| Goal mentions a function defined by pattern matching | `mcases {f}` |
+| Goal contains a literal `\case` | `mcases \with { … }` |
+| Remember the scrutinee's value while matching | `cases (e arg addPath)` |
+| `coe` / `transport` chains in the goal | `simp_coe` |
+| A definition in the goal must be unfolded | `unfold f body` |
+| The witness is already in the context | `assumption` |
+| A search-based meta drowns in hypotheses | `usingOnly (h_1, …) body` |
+| One derived fact needed inside one expression | `using (h) body` |
+| A meta in a `run` fails with an unresolved goal | prefix it with `later $` |
+| Need to see an intermediate goal | replace an entry with `{?}` |
 
 ---
 
-## When a meta fails — quick triage
+## Error → first move
 
-1. Read the actual error. `Cannot resolve reference 'X'` → missing import. `The type of a lemma must be a proposition` → `\lemma` → `\func`. `Type mismatch: Expected type: a class. Actual type: \Set0` → using `Nat.<=` or similar; switch to bare operators with `Arith.Nat`.
-
-2. If `simplify` says `Meta 'simplify' failed`: the meta tried to normalize and the two sides didn't reconcile. Don't keep retrying — switch strategy. Try `equation` (with intermediates), or do one `rewrite` to align sides then `simplify`, or just write `pmap`/`*>` by hand.
-
-3. If `cong` fails on something that looks obvious: check that the relevant `x_i = y_i` is actually visible in the local context (not buried inside a `\Sigma` or `\let`-bound under a different name).
-
-4. If `linarith` fails: first check whether the goal is genuinely linear (atoms multiplied by constants, summed, compared) — if it's a polynomial identity like `(A-B) - (A+B) = -2B`, switch to `equation.cRing`. If the goal IS linear and the error is `Cannot infer an instance of class 'LinearlyOrderedSemiring'`, the instance isn't in scope — for `Real`, add `\import Arith.Real.Field`; for `Rat`, `\import Arith.Rat`; for `Nat`, `\import Arith.Nat`. Since commit `ab3dc1dba` (`solveEquationsFor` inference push), `\open RealField` / `\open RatField` is no longer required. If the import alone doesn't fix it, check that no local tutorial-style class is shadowing the real one.
-
-5. If `rewrite` complains it can't find the LHS: the LHS in `p` may already be reduced away in the goal (definitional unfolding). Try `rewrite p in t` to operate on `t`'s type, or `rewrite` a hypothesis instead.
-
-6. If `ext` produces a weird subgoal with `coe` in it: the equality is between dependent Σ/record values and the meta inserted a transport. Either prove the corrected goal directly, or follow up with `simp_coe`.
-
-7. If `equation` fails with `Ring solver failed` and the printout's two sides differ only by argument order (`v0*v1*v2` vs `v2*v0*v1`): you need commutativity. Switch to `equation.cRing` (or `equation.cMonoid` if no addition). The plain `equation` solver is non-commutative; commutative is opt-in via the qualified variant.
-
----
-
-## Looking things up — cheap to expensive
-
-When you're mid-proof and need to find a lemma, a class field, a norm law — the temptation is to `grep -r` the sources. **Resist.** The cost ordering is:
-
-1. **`-ss <name>` for name lookup** — fast, served from a per-library on-disk index. Prints each match's location, qualified name, kind, and a **one-line signature**, so it often answers the question outright without opening anything. Start here whenever you can guess any part of the name.
-2. **`-ss <Module>.<name>` when you know the owner** — a dotted pattern matches parts of the qualified name, so `-ss Monoid.*-comm` narrows to one module's members instead of the whole library.
-3. **`-ps "<shape>"` for shape lookup** — slow (~20s) but the right tool when you know the type and not the name. Negative results are equally valuable.
-4. **`-ch <class>` / `-fu <name>` for structure** — which classes extend what and which instances exist (`-ch`), or how a definition is actually used at its call sites (`-fu`).
-5. **Sources (`arend-lib/src/<module>.ard`) last** — only when you need the proof body, a precise reduction, or to confirm a default implementation. Read the signature line and skip the body. Don't read sources to *find* something — only to *understand* it.
-
-**Default discipline: when about to write `\lemma foo : <shape> => {?}`, run `-ps "<shape>"` first.** When about to grep sources for "where does `norm_+` live?", run `-ss norm_+` instead — the one-line signature in the result is usually the whole answer.
-
-### `-ss` dialect prefixes — concrete examples
-
-**`arend -ss --help` is authoritative; run it rather than trusting a table.** (`arend -ss help`,
-no dashes, searches for the *name* "help".) The default is **smart-case substring on short
-names**, not regex — reaching for `.*` means you guessed wrong, and a dot silently turns the
-query into a *qualified-name* search:
-
-| Want | Wrong | Right |
+| Message | Likely cause | First move |
 |---|---|---|
-| Names containing `BigSum` and `<=` | `-ss "BigSum.*<="` (→ long-name query, `No matches`) | `-ss "glob:*BigSum*<=*"`, or filter the output — **there is no `contains=` on this build** |
-| Names matching `norm_*_<=` literally | — | `-ss "norm_*_<="` (plain mode is literal; `*` needs no escaping) |
-| Exact short name | — | `-ss "glob:pmap"` (`glob:` with no wildcard is exact; `eq:` was removed and errors) |
-| Either of two name patterns | `-ss "A\|B"` (literal `\|`, matches nothing) | `-ss A -ss B`, or `-ss "A B"` |
-| Glob wildcard | `-ss "Big*<="` (literal) | `-ss "glob:Big*<="` |
-| Genuine regex | `-ss "^abs.*_+"` (literal) | `-ss "re:^abs.*_\+"` |
-| Method under a given class path | — | `-ss "Monoid.*-comm"` (long name: dotted parts of the qualified name) |
-
-Options are separate `-ss` arguments and there are only three: `limit=N` (0 = unlimited,
-default 200), `kind=func,lemma,…`, and `self`. **`lit:`, `contains=`, `only=`,
-`case-sensitive` and `no-cache` do not exist here** — an earlier revision of this skill listed
-them. Worse, **an unrecognised token is silently accepted as an extra OR'd pattern**, so a
-stale filter *widens* the results: `-ss BigSum contains='<='` returns `AddMonoid.BigSum`, whose
-name has no `<=`, and the same count as bare `BigSum`. Every run echoes the parsed query as
-`Searching for (OR): …` — **read those two lines**; they are the only signal.
-
-`-ss` searches **short names only** — `Module.Foo` queries match `Foo`. To find a method on a class, query the bare method name and read the qualified result.
-
----
-
-## When to reach for `run { {?} }`
-
-`run { m1, m2, ..., t }` chains metas left-to-right around a seed term `t`. Useful for *step-by-step refinement* of a goal where each step is a known meta application.
-
-**Reach for it when:**
-
-- The proof is dominated by **rewrite chains** (`rewrite p`, `rewrite q`, `simplify`) and you want to discover them one at a time. Wrap the goal in `run { {?} }`, then iteratively replace the inner `{?}` with `rewrite <something>, {?}` and re-typecheck to see what the new goal looks like.
-- You're doing **goal manipulation** (transports, rewrites, simplifications) rather than building a value out of named pieces.
-- The proof is a **`<∘`-chained inequality** — `run { rewrite <align>, \`<∘ <strict-bound>, linarith }` collapses what would otherwise be 5+ named intermediates.
-- You want a more *imperative-style* proof — "first do this, then this, then close with `idp`."
-
-**Don't reach for it when:**
-
-- The proof's bottleneck is *mathematical content*, not *tactic plumbing*. If the inductive-step bound itself fails (counterexample), no `run` chain will help — the lemma needs a different argument.
-- You're assembling a value out of named helpers (`\have | h1 => ... | h2 => ... \in combine h1 h2`). The `\have` chain is clearer there.
-
-A practical hybrid: use `\case \elim n` to set up induction, prove the trivial base, then for the step replace `{?}` with `run { {?} }` and refine inside.
+| `Cannot resolve reference 'X'` | missing import, or a class `\func` member used bare | see *Imports* |
+| `The type of a lemma must be a proposition` / `Actual level: \Type` | e.g. `f x = f y` for `f : A -> B`, `B : \Type` | `\func`; promote to `\lemma` only when the type is a proposition |
+| `Type mismatch` / `Expected type: a class` / `Actual type: \Set0` / `In: Nat` | `a Nat.<= b`: `Nat` is a data type, not a class | bare `<=` with `Order.PartialOrder` + `Arith.Nat` (other causes: **arend-quirks**, *"Expected type: a class" — causes*) |
+| `Nothing to simplify` / `Expressions are not equal`, or `Meta 'simplify' failed` | needs commutativity or distribution | `equation`, or one `rewrite` then `simplify` |
+| `Ring solver failed`, sides differ only in order | instance found is non-commutative | check the class; `equation.cRing` |
+| `Monoid solver failed` at a ring without `ide` | no rng solver | hand chain, or a unital class |
+| `Ring solver failed` with `where` atoms like `pow {R} t (s + j)` | sums in exponents | split with `rewrite (Monoid.pow_+, …)` first |
+| `Cannot solve the equation` from `linarith`, sides algebraically equal | polynomial identity | `equation` |
+| `Cannot solve the equation` from `linarith`, assumptions look sufficient | sum-factor products, factor order, folded `\func` constant, too many hypotheses | see *linarith* |
+| `Cannot find subexpression`, `{?error}` in the pattern | the rewrite lemma's implicits are unsolved | spell them; see **arend-quirks**, *Concrete instances compute* |
+| `Cannot find subexpression`, the pattern visible in the printed goal | the pattern appears only after evaluation | write the step as a chain element |
+| `Cannot find subexpression` naming a term in an `equation.group {…}` call | the step does not span a chain position | `pmap` the hypothesis into a whole-side bridge, or pivot |
+| `Expected type: \Pi (i : I) -> ?A i` from `ext` | `ext`'s argument failed to elaborate | see *ext* |
+| `Cannot solve equation` pairing `\Set0` with `E`, or `TruncP` with `contains`, then a mismatch printing a type where an element belongs | the receiver of a class member is a computed value, so nothing solves it | pin it: `C.member {receiver} …` — **arend-quirks**, *Instance search* |
+| two `Cannot solve equation` lines naming two different index objects, unsolved `?a` next to a solved-looking functor/structure | an implicit with two valid readings, Arend picked the wrong one | pin the whole implicit prefix — **arend-quirks**, *Implicit arguments* |
+| a meta in a `run` complains about an unresolved goal but works alone | expected type not pinned yet | `later $` |
 
 ---
 
-## Style — when to prefer which surface form
+## Style
 
-- **Pure rewrites on the goal**: `rewrite (p, q, r) idp` is shorter than a `run`-block. Use it.
-- **Multiple rewrites + an algebraic close**: `rewrite (p, q) equation.cRing`. One line.
-- **Mixed chains**: use `run`. The vertical layout reads better than nested calls.
-- **Single-step manipulation of a hypothesis**: `f at h $ body`. Two-step+: `run { f1 at h, f2 at h, body }`.
-- **Equation with three or more steps and you want each to be named**: use `==<`/`>==`/`qed`, not `equation`. The named form is what the reader will navigate.
-- **Equation where every step is `simplify` or trivial**: use `equation` with no explicit steps if possible.
-- **Prop-irrelevance bridge** (`F p = F p'` from a single component path): use multi-`\elim` with `idp` in the same clause list, not a nested helper.
+Write in the target style from the first attempt — the typechecker tells you quickly when a compact form needs expanding. The end-of-task pass is **arend-formalize**, *4. Finish checklist* (dead code, naming, placement, hypotheses); its redundancy group is the *Compaction* list below.
 
----
+### Choosing a surface form
 
-## Style — compaction
+- **Pure rewrites of the goal**: `rewrite (p, q, r) idp` — shorter than a `run` block. Merge consecutive rewrites: `rewrite (A, B) $ rewrite (C, D) t` → `rewrite (A, B, C, D) t`.
+- **Rewrites + algebraic close**: `rewrite (p, q) equation`, one line.
+- **Mixed chains** (rewrite, `pmap`, sections): `run { … }`; the vertical layout reads better than nesting.
+- **One step on a hypothesis**: `f at h $ body`; several: `run { f_1 at h, f_2 at h, body }`.
+- **Three or more steps worth naming**: `==<` / `>==` / `qed`. All steps trivial: `equation` with no intermediates.
+- **Proof-irrelevance bridge** (`F p = F p'` from one component path): multi-`\elim` with the path in the same clause list, not a nested helper.
+- **`run { {?} }` for step-by-step refinement** of goal manipulation (rewrites, transports, simplifications): wrap the goal in `run { {?} }`, replace the inner `{?}` by `rewrite <something>, {?}`, re-typecheck, repeat. Hybrid: set up induction with `\case \elim n`, prove the base, refine the step inside `run { {?} }`. Not when the difficulty is mathematical (if the step's bound is false, no chain helps), and not when assembling a value from named pieces — a `\have` chain is clearer there.
 
-Apply these while writing, not only on a post-pass:
+### Compaction
 
-- **Flatten `\case … \with { | inP (…) => … }` into `\let | (inP (…)) => e`.** This is the single biggest de-bloater in existential-heavy developments: every `\case` on a `TruncP` costs a nesting level and two lines of punctuation, and a chain of five of them buries the punchline 20 columns deep. `\let` bindings are sequential, so a whole cascade collapses to one flat block:
+Apply while writing; then execute it item by item as the redundancy pass of the finish checklist, re-typechecking after each change.
 
-    ```arend
-    \let | (inP (e1, e1>0, e1<eps)) => shrink eps>0
-         | (inP (delta', delta'>0, IH)) => match-bounded B>=1 e1>0
-         | (inP (q, q>0, qP))          => split-eps delta'>0 …
-    \in inP (…)
-    ```
+- **Omit and re-typecheck**: every explicit implicit `{…}`, every type ascription `(e : T)`, every binder annotation `\lam (x : T) =>`. Restore only what the typechecker asks for. Within a chain, only the first ("anchor") step usually needs its implicits; later steps and the bodies of per-index lambdas recover theirs from their neighbours.
+- **Qualify with the instance, not the class**: `inst.f args`, never `C.f {inst} args` (`R.pow x n`, not `pow {R} x n`). Don't qualify operators at all when the operands' types pin the instance; named lemmas outside the opened set still need qualification (a selective `\open M (f, g)` shortens them).
+- **`\new Array A n (\lam i => e)` → `\lam i => e`.**
+- **Sections instead of lambdas**: `\lam x => x + e` → `(+ e)`; slot composers `` `<∘ b `` and `$` instead of nested parentheses.
+- **`transport (\lam x => P x) (inv p)` → `transportInv P p`**, and `transportInv (\lam x => C x) p t` → `rewrite p t` whenever the goal is what is being reshaped.
+- **Replace hand-stepped `\have` chains** with `simplify` / `equation` / `linarith` when one of them closes the goal outright.
+- **Hand-written `\case d \as d \return … \with {…}` motives → `mcases \with {…}`.**
+- **Flatten existentials with `\let`.** `\case e \with { | inP (…) => body }` → `\let | (inP (…)) => e \in body`; `\let` bindings are sequential, so a cascade of truncated existentials becomes one flat block. Works whenever the result is a proposition; keep `\case` for genuinely multi-constructor scrutinees (`||`, `Or`, `Dec`).
 
-  Works wherever the result type is a `\Prop` (which is the case for every `∃`-returning lemma). Established arend-lib idiom — ~30 sites. Keep `\case` only for genuinely multi-constructor scrutinees (`||`, `Dec`, `Or`).
+  ```arend
+  \lemma let-ex (h : ∃ (n : Nat) (n = 0)) (k : ∃ (m : Nat) (m = 1)) : ∃ (a b : Nat) (a + b = 1)
+    => \let | (inP (n, p)) => h
+            | (inP (m, q)) => k
+       \in inP (n, m, rewrite (p, q) idp)
+  ```
+- **Interleave `\let` and `\have` at one indentation level** (`\let … \in \have … \in \let … \in body`, each `\in` at the same column) instead of nesting: `\have` for proofs, `\let` for values.
+- **Inline single-use helpers and single-use `\have`s** — unless the `\have`'s ascription is what pins a lemma's implicits (see **arend-quirks**, *Opaque bindings: \have and \let*).
+- **Pattern-match arrays with `::`** instead of rebuilding tails: with `\elim n, r` and clauses `| 0, nil` / `| suc n, a :: l`, the tail is the variable `l` rather than `\new Array A n (\lam i => r (suc i))` at every call.
 
-- **Interleave `\let` and `\have` at one indentation level** rather than nesting. `\let … \in \have … \in \let … \in body`, each `\in` starting a line at the same column, reads as a linear derivation and honours "`\have` for proofs, `\let` for values".
+  ```arend
+  \func sumArr {n : Nat} (r : Array Nat n) : Nat \elim n, r
+    | 0, nil => 0
+    | suc n, a :: l => a + sumArr l
+  ```
 
-- **`\have` works as a `run { … }` entry** and scopes over the rest of the block, exactly like `\lam x,`:
-
-    ```arend
-    => run {
-      \have | tail : … => …
-            | eq   : … => …,
-      rewrite eq,
-      <final term using tail>
-    }
-    ```
-
-  Verified 2026-08-10. Worth it when the payoff after the rewrite is short; if the final term is the bulk of the proof, plain `\have … \in rewrite eq $ …` reads better because it keeps the punchline on top.
-
-- **`rewrite p t` instead of `transportInv (\lam t => C t) p t`** whenever the goal is the thing being reshaped. Declaring the rewriting lemma with *implicit* arguments (`polyCoef_- {a b j}`, not `polyCoef-minus (a) (b) (j)`) is what makes this pay: the call site becomes a bare `rewrite polyCoef_- h` instead of a motive plus three spelled-out arguments. Use `rewriteI` for the other direction. `transport` survives only where the expected type is *not* pinned (an argument of `linarith (…)`, one side of a `<=∘` whose middle term is free).
-
-- **Merge consecutive rewrites into the tuple form.** `rewrite (A, B) $ rewrite (C, D) t` → `rewrite (A, B, C, D) t`; the tuple form *is* nested rewrites applied left to right.
-
-- **Pattern-match arrays with `::` instead of rebuilding the tail.** A function over `Array A n` written `\elim n` has to spell its tail as `\new Array A n (\lam i => r (suc i))` at every recursive call and in every downstream lemma. Switching the signature to `\elim n, r` with clauses `| 0, nil` / `| suc n, a :: l` makes the tail the bound variable `l` and deletes the noise everywhere:
-
-    ```arend
-    \func prodLin {R : CRing} {n : Nat} (r : Array R n) : Poly R \elim n, r
-      | 0, nil => 1
-      | suc n, a :: l => prodLin l * padd 1 (negative a)
-    ```
-
-  The cost is that `prodLin r` no longer reduces for a *variable* `r` (arend-quirks §3) — so convert the whole family of functions and lemmas over the same array together. Literal `z :: r'` call sites still reduce, and record-eta made the old form reduce to the same thing anyway.
-
-- **An eta-lambda `(\lam k => f k)` is not always removable.** If the expected domain is `Fin m` and `f`'s is `Nat`, the lambda is carrying the `Fin → Nat` coercion; deleting it gives `Type mismatch: \Pi (k : Fin m) -> … vs \Pi (k : Nat) -> …`. Drop eta-lambdas only when both domains agree.
-
-- **Abstract a repeated compound constant into a parameter of the helper, not a `\have`.** When a bound like `coefMax {C} (p - monomial 1 (suc m)) (suc m)` appears five times inside one proof, `linarith`/`equation.cRing` treat it as an opaque blob and every line grows by 50 characters. Give the helper lemma `{C : Real} (C>=0 : 0 <= C) (hC : \Pi k -> … <= C)` and pass the concrete bound once at the call site: inside the helper `C` is a genuine variable, so the solvers see through it. A `\have C => <blob>` does *not* work here — the binding is opaque to implicit-argument inference (arend-quirks §7); bind the *proof* (`\have C>=0 => coefMax>=0 {…} {…} {…}`) instead and let `?C` be read off its type.
-- **Delete** idp-bodied lemmas and `pmap f idp` steps — they carry no content.
-- **Inline** single-use helpers and single-use `\have` clauses — *unless* the `\have`'s type ascription is what solves a downstream lemma's implicits (see the load-bearing-`\have` entry under *Workflow and language gotchas*).
-- **Replace** hand-stepped `\have` chains with `simplify` / `equation.cRing` / `linarith` where one of them closes the goal outright.
-- **Flatten** with slot notation (`` `<∘ b ``, `__ + 1`) and `$` instead of nested parens.
-- **Migrate** helpers used by exactly one parent into that parent's `\where`.
-- **Alias** hot long names file-locally with `\open M \using (Long \as short)` — e.g. `\open Complex \using (iunit \as i)` (`Arith/Complex.ard:19`).
-- **Hoist** repeated explicit embeddings to `\use \coerce` — see **arend-quirks** §10.
-- **Prop-irrelevance bridges**: multi-`\elim` with the path in the same clause list.
-- **Tuple-then-solver**: `rewrite (p, q) equation.cRing` rather than sequential rewrites.
-- **Doc comments**: prefer `-- | …` one-liners; `{- | … -}` nests, so LaTeX braces like `x^{-1}` can swallow the rest of the file — see **arend-quirks** §19.
-
-(These were previously kept in a separate `arend-refactor` skill. That skill's `SKILL.md` had been overwritten with a duplicate of `arend-error-extraneous-input`, so it was deleted on 2026-07-28; this list is the surviving summary.)
-
----
-
-## Log friction
-
-Anything that felt unreasonable about the **tooling** — surprising typechecker errors, instance inference that should "just work", misleading diagnostics, slow CLI paths — goes to `arend-issues.md` at the repo root (`/home/sergey/Documents/Arend/arend-issues.md`) with a one-liner on where it bit you. Future you needs the trail.
-
-**State of that file: deleted 2026-05-21 (`f0c5f9dbf`, "Remove issues/blueprint"), recreated 2026-08-03** at the user's request to hold CLI/typechecker feature requests derived from the two "Refactor AI slop" reviews. Its old numbered entries are gone, so never cite "`arend-issues.md` #N" — append new entries instead.
-
-**Missing library statements do not belong here.** A gap in arend-lib is a contribution opportunity, not a complaint to file: add the helper directly to the appropriate module. `arend-issues.md` is for things the agent *cannot* fix by editing arend-lib — tooling and language-level friction.
-
----
-
-## Anti-patterns
-
-- **Iterating proof attempts without a daemon.** Every cycle then pays JVM startup plus a full library load — minutes per attempt instead of seconds. `arend . -d --serialize` once at the top of the session.
-- **Omitting `--serialize`.** It is opt-in — without it no `.arc` is ever written, so caches never warm and every “forced recompile” fix is discarded on exit. Bootstrap with `arend . -d --serialize`. There is no `--no-serialize`.
-- **Concluding "the recompile didn't help" from a daemon-served `-r`.** The daemon discards `-r`, so nothing was recompiled. Use `--no-daemon -r`.
-- **Attacking a 200-line proof as one expression.** Decompose first, attempt second.
-- **Filtering typecheck output with `grep "GOAL"`.** Narrow the *scope* instead of the *output* — `arend . <Module>:<def>` checks only the def you care about, and grep would cut off the `Expected type:` / `Context:` lines that make a `[GOAL]` block worth reading.
-- **Working around a missing 3-line helper inline.** Add it to the right module; everyone benefits. (And don't log it as an "issue" — just add it.)
-- **Spending an hour on `transport (\lam x => x.U _) p t` when `rewrite p` works.** Recognize the "Expected type: a class" symptom early.
-- **Treating a typechecking proof as "done" without re-reading it.** Same caveat as the formalize skill — typechecking proves consistency, not faithfulness. Verify the proof closes the *intended* mathematical goal.
-- **Stating a helper lemma before running `-ps "<its shape>"`.** Cheaper to learn the helper exists (or doesn't) than to write a redundant skeleton.
-- **Sprinkling `Module.op` qualifiers when the ambient instance suffices.** Bare operators resolve through type inference for primitive operations; only qualify named lemmas that aren't in the open set.
-- **Grepping `arend-lib/src/` to find a lemma.** `-ss` prints a one-line signature per match at a fraction of the tokens, and `-ps` finds things by shape when you can't guess the name at all. Sources are for reading proof bodies, not for navigation.
-- **Typing `.*` or `\|` into a `-ss` query.** That's regex muscle memory on a substring-by-default tool. Use `contains=` for AND, multiple `-ss` flags for OR, or `re:`/`glob:` prefixes when you genuinely need a wildcard.
-- **Naming every intermediate value in a proof you're writing for the first time.** The compaction idioms under *Style — compaction* above (multi-`\elim` with paths, `rewrite (tuple) equation.cRing`, `run` with slot-notation composers) are the target style *from the first attempt*, not just post-pass. Try the compact form first — the typechecker tells you fast if you need to expand.
+  The function then no longer reduces on a *variable* array, so convert the whole family of functions and lemmas over the same array together.
+- **An eta-lambda that carries a coercion is not removable.** `\lam k => f k : Fin 3 -> Nat` for `f : Nat -> Nat` typechecks; plain `f` is `Type mismatch` / `Expected type: Fin 3 -> Nat` / `Actual type: Nat -> Nat`. Drop eta-lambdas only when the domains agree.
+- **A compound constant repeated inside one proof** (a long bound appearing five times) is an opaque blob to the solvers and lengthens every line. Make it a parameter of a helper (`{C : R} (C>=0 : 0 <= C) (hC : … <= C)`) and pass the concrete value once at the call site; inside the helper `C` is a variable. A `\have C => <blob>` does not achieve this (see **arend-quirks**, *Opaque bindings: \have and \let*).
+- **A case split needed inside a `\have`**: factor it into a separate `\private \lemma` rather than an embedded `\case \elim`.
+- **Named constants**: use the library's named lemma for constant facts (`0 < 1` in a field, …) instead of re-deriving them — find it with `-ss`/`-ps`.
+- **Repeated explicit embeddings** (`fromX x` at every call) → a `\use \coerce` (see **arend-quirks**, *Coercions*).

@@ -1,418 +1,261 @@
 ---
 name: arend-formalize
-description: Procedural workflow for turning an informal mathematical statement into a typechecking Arend definition/lemma. Use when the user gives an informal claim and asks for a formalization, or when starting a new .ard file from a math text. Covers what to read first, which CLI tools to reach for, and the order of operations from "I have an idea" to "only GOAL errors remain".
+description: Procedural workflow for turning an informal mathematical statement into a typechecking Arend definition/lemma, and the CLI tooling around it — the daemon, binary caches and their recovery, and the lookup flags `-ss`/`-ps`/`-fu`/`-ch`/`-sc`. Use when the user gives an informal claim and asks for a formalization, when starting a new .ard file from a math text, when looking something up in a library, or when the CLI reports errors that look like stale state. Covers what to read first, which CLI tools to reach for, the order of operations from "I have an idea" to "only GOAL errors remain", and the finish checklist.
 user-invocable: true
 ---
 
 # Arend formalization workflow
 
-A staged process for going from an informal claim to a typechecking Arend statement. The three phases are interleaved in practice — but resist the temptation to start writing `.ard` before phase 1 is done.
+This skill takes you from an informal claim to a typechecking Arend statement. In practice the phases overlap, but don't start writing `.ard` before phase 1 is done.
 
-For language-level surprises while writing the statement, see the **arend-quirks** skill. For closing equality/algebra goals once the statement compiles, see the **arend-prove** skill.
+For language-level surprises while writing the statement, see **arend-quirks**. For closing goals once the statement compiles, see **arend-prove**.
 
 ---
 
-## Phase 0 — Start the daemon
+## 0. Tooling: daemon, caches, where to run
 
-> **`--serialize` exists and is opt-in.** Verified against `ConsoleMain.parseArgs` on the current tree: the flag is registered as
-> *“after typechecking, persist typechecked modules as .arc binary caches; **without this flag, no .arc files are written**”*.
-> There is **no `--no-serialize`** — passing it fails with `Unrecognized option: --no-serialize`.
-> An earlier revision of this skill claimed the opposite (removed flag, serialization on by default, `--no-serialize` opt-out).
-> That was wrong in both directions; every recipe below has been corrected. **Writing `.arc` requires `--serialize` on the call
-> that does the typechecking** — and for a daemon-served call that means on the `-d` bootstrap (see below).
+**Run every command from inside the library directory**, the one holding `arend.yaml`, or name the library as the first positional (`arend arend-lib -ss Monoid`). Otherwise the command has no library and prints `Nothing to load` … `[ERROR] No libraries to search.`
 
-The edit loop is dominated by JVM startup and library load, not by typechecking your edit. The fix is the **daemon**: a long-lived JVM holding a warm `ArendServer`. Start it once per session:
+### The daemon
+
+The daemon exists only in builds whose `arend --help` lists `-d`; it is not in the 1.12.0 release. Without it, every call pays for JVM startup and a full library load, which dominates the edit loop. The daemon keeps a warm server instead:
 
 ```bash
-cd /path/to/arend-lib && arend . -d --serialize
+arend -d --serialize        # once per session, in the library directory (./arend.yaml when no LIBRARY is given)
+arend . <Module>[:<def>]    # every later call in that library is routed to the daemon automatically
 ```
 
-Bootstrap runs the ordinary typecheck pipeline once over the whole library — with exactly the flags `-d` forwarded
-(`-s -e -m -c -r --serialize`) — and then idles. **Every subsequent `arend` call in that library auto-routes to it**
-— no flag needed on the client side — so a scoped typecheck comes back in seconds instead of minutes.
-`--daemon-refresh` re-submits that same frozen bootstrap argv against the warm context (`DaemonServer`'s `refresh`
-op literally replays `ctx.bootstrapArgs`), which is how source edits get picked up.
+Starting the daemon resolves the libraries and typechecks nothing, so the first typecheck after it pays for the library.
 
 | Command | Effect |
 |---|---|
-| `arend . -d` | start the daemon (needs a `LIBRARY` anchored to an `arend.yaml`, or `-s <dir>` for a synthetic library) |
-| `arend . --daemon-ping` | `IDLE` or `BUSY`; `[ERROR] ping: no daemon running…` if there is none |
-| `arend . --daemon-status` | dump state |
-| `arend . --daemon-refresh` | re-run the `-ai` bootstrap on the warm context so source edits are picked up |
-| `arend . --daemon-stop` | stop it |
-| `arend … --no-daemon` | force in-process execution for this one call |
+| `arend -d` | start a daemon holding the given libraries |
+| `arend --daemon-ping` | `IDLE` or `BUSY`; an error if no daemon serves the library |
+| `arend --daemon-status` | the daemon's state, including the locked flags in force |
+| `arend --daemon-refresh` | resolve the libraries again, typechecking nothing. Call it after creating, deleting or renaming a module file, before a query or a typecheck that should see the change |
+| `arend --daemon-stop` | stop it |
+| `arend … --no-daemon` | run this one call in-process |
 
-### Flags the daemon eats
+**Locked flags.** On a call served by the daemon, `-L -s -e -m -c -r --serialize` are warned about and ignored. The daemon's own values apply, which are the ones given to `-d`. Inside a served command, `-i` and the `--daemon-*` flags are rejected outright. Two consequences:
+- `arend -r <Module>` against a live daemon recompiles nothing. Write `--no-daemon -r`, or stop the daemon first. Otherwise you will conclude "the recompile didn't fix it" from a run that never recompiled.
+- A daemon started without `--serialize` never writes an `.arc` file, whatever the served calls pass. `--daemon-status` shows which flags are in force.
 
-This is the part that bites. On a daemon-served call these are **parsed but silently ignored**, locked to the daemon's bootstrap values:
-
-```
--L   -s   -e   -m   -c   -r   --serialize
-```
-
-(That is `LockedFlags.NAMES` verbatim. `--slow-warn` is **not** a flag on the current tree either — an older
-revision listed it here and it hard-errors.)
-
-`--serialize` being locked is the second consequential entry: **a daemon started without `--serialize` will never write an
-`.arc` file, no matter how many served calls pass the flag.** If you want warm caches, bootstrap with
-`arend . -d --serialize` — `-d` forwards `-s -e -m -c -r --serialize` to the child JVM, and the child's copy is the one
-that counts. `--daemon-status` prints the locked set actually in force, so it settles the question.
-
-`-r` being in that list is the consequential one: **a plain `arend -r <Module>` against a live daemon does not recompile anything.** To actually force a from-source pass you must either add `--no-daemon`, or `--daemon-stop` first.
-
-These are rejected outright inside a daemon-served command (not ignored — hard error): `-i`, `-d`, `--daemon-stop`, `--daemon-ping`, `--daemon-status`, `--daemon-refresh`.
-
-### Binary caches (`.arc`) under the current CLI
+### Binary caches (`.arc`)
 
 | | Behaviour |
 |---|---|
-| **Loading** existing `.arc` | On by default. `-r` / `--recompile` turns it off for one run — *but see the daemon-eats-`-r` note above*. |
-| **Writing** `.arc` after typecheck | **Off by default.** `--serialize` turns it on. There is no `--no-serialize`. On a daemon-served call the flag is locked to the `-d` bootstrap's value. |
+| **Loading** existing `.arc` | On by default. `-r` / `--recompile` skips it for one run (not on a served call). |
+| **Writing** `.arc` after a typecheck | Off by default. `--serialize` turns it on; there is no `--no-serialize`. On a served call, the daemon's value applies. |
 
-**When the cache itself is the suspect.** After a class-hierarchy refactor, cached expressions referencing the old internal terms still deserialize cleanly and report errors that don't exist in the sources. Symptoms:
+### Stale caches and a poisoned daemon
 
-- Bogus type mismatches naming what looks like the same type twice (`Rat` vs `Arith.Rat.Rat`).
-- Errors on definitions you never touched, which vanish under `-r`.
-- A Java stack trace out of the (de)serializer rather than a typecheck diagnostic.
+These symptoms mean the state is stale, not the sources. They are typical after a class-hierarchy refactor:
+- errors on definitions you never touched, which vanish under `-r`;
+- type mismatches that print the same type twice under two names (`Rat` vs `Arith.Rat.Rat`);
+- a Java stack trace out of the (de)serializer instead of a typecheck diagnostic;
+- `arend` hangs, comes back with empty or suspiciously short output, or reports something that disagrees with what's on disk.
 
 Recover with **`arend --no-daemon -r --serialize <Module>`**. All three parts matter:
+- `--no-daemon`, because a served `-r` is ignored;
+- `-r`, to skip loading the caches;
+- `--serialize`, so that the clean build replaces them. Without it the clean build writes nothing, and the next run reads the same bad `.arc`.
 
-- `--no-daemon` because a daemon-served `-r` is a no-op;
-- `-r` because it skips *loading* the caches;
-- `--serialize` because otherwise the clean build **writes nothing** and the poisoned `.arc` is still on disk for the next run.
+For a one-off second opinion, leave `--serialize` off.
 
-The `-r --serialize` pairing is therefore *required*, not obsolete: `-r` reads past the bad cache, `--serialize` replaces it.
-Drop `--serialize` and you get a correct one-off answer followed by the same bogus errors on the very next invocation.
+If the clean run is fine but the served one isn't, restart the daemon: `arend --daemon-stop && arend -d --serialize`. The same goes for a daemon that denies a definition plainly present in the sources, which can happen after a transient resolution error such as a duplicate name or a half-saved file. `-r` cannot fix this inside the daemon, and `--daemon-refresh` is not reliable here.
 
-### The daemon has its own failure mode: poisoning
+**On a Java exception (a stack trace, not a typecheck error), snapshot before recovering.** The `.arc` files are the only evidence of the serialization bug, and recompiling destroys them. First zip the library tree (sources and `bin/*.arc`) to an archive outside it, `zip -qr /tmp/<lib>-crash-$(date +%Y%m%d-%H%M%S).zip <library-dir>`, and tell the user the path. Only then recover. The exception to this is a parser exception right after a syntax error: it is fallout of that error, so fix the syntax instead (see **arend-error-extraneous-input**).
 
-A resolution error during a daemon run can leave the warm server in a state where importers deny a definition that is plainly visible in the sources. **In-daemon `-r` does not recover it** (it's ignored — see above); neither does `--daemon-refresh` reliably. The only reliable fix is:
-
-```bash
-arend . --daemon-stop && arend . -d
-```
-
-Related, and now fixed: the daemon used to report stored resolver errors only on the *first* run, so a warm re-run of a still-broken module could exit 0 with no diagnostics (arend-lang/Arend#138, fixed 2026-08-08). On a current build, warm-run exit codes are trustworthy again and errors print after the banner. If you are on an older build and a warm run looks suspiciously clean, re-check with `--no-daemon`.
-
-### `-ai` — the agent-oriented pipeline
-
-> **Not present on the current tree (verified 2026-09-10).** `-ai` is not a registered option in
-> `ConsoleMain.parseArgs` on either `staging` or `cliDaemon-9`, no source file writes a `.sig/` mirror, and
-> `TypecheckPipeline` contains no symbol-index refresh. Passing `-ai` hard-errors with `Unrecognized option`.
-> The daemon's bootstrap is a plain typecheck of the library, **not** an `-ai` pipeline. Treat this section as a
-> description of an unmerged/planned feature; do not build a workflow on it until `-ai` shows up in `--help`.
-
-As designed, the daemon's bootstrap would *be* `-ai` and `--daemon-refresh` would re-run it; standalone `arend . -ai [MODULE[:DEF]]`. Four stages:
-
-1. **Name resolution (suggest-only)** — for each unresolved short name, prints a `Candidates for 'X' at …` block with each candidate's `library::module:longName`, the qualified name to splice in, and the required import. It never rewrites your sources; you paste the pick yourself.
-2. **Typecheck** of the in-scope modules.
-3. **Signature mirror** — writes signature-only views of every typechecked module to `<library>/.sig/<module>.ard`, with bodies and field implementations replaced by `{?}`. Definitions with typecheck errors become `-- skipped: <name> (typecheck errors)`, so **`.sig/` only ever contains verified declarations** — that is what makes it safe to read as ground truth.
-4. **Symbol index refresh** — rebuilds the on-disk index behind `-ss` / `-fu` / `-ch` / `-sc`.
-
-Output is quiet by default (verbose narration goes to a per-invocation log); `--no-quiet` puts it back on stdout.
-
-**Run every call from inside the library directory.** `cd arend-lib` first: the typecheck workflows and the retrieval flags (`-ss`, `-ps`, `-fu`, `-ch`, `-sc`) all expect the library in scope, and invoking them from the parent dir crashes with `NullPointerException: ctx.outputRouter is null` instead of a clean "no library in scope" error.
+**The symbol index lags for a brand-new module.** `-ss`, `-fu` and `-ch` are served from a per-library on-disk index that re-parses only changed files, so a module you just created can be missing for a round. A `No matches` on something you just wrote is an index artefact, not a broken definition. Typecheck the module (with a daemon, `--daemon-refresh` first), then query again.
 
 ---
 
-## Phase 1 — Before formalizing: orient yourself in arend-lib
+## 1. Orient: look things up before writing
 
-Goal: figure out whether the prerequisites already exist, whether someone has already done this, and what names/classes to reuse. Cheap reads first, expensive reads last.
+Goal: find out whether the prerequisites exist, whether someone has already done this, and which names and classes to reuse. The retrieval flags query the loaded library without typechecking it. Go from cheap to expensive:
 
-1. **Start with the retrieval flags, not the sources.** `-ss` / `-ps` / `-fu` / `-ch` / `-sc` query the loaded library without typechecking it, and they answer "does this exist / what shape is it / who uses it" far more cheaply than reading `.ard` files. Work out *which module* owns the concept from their qualified results, and only then open sources.
+1. **`-ss <name>`: name lookup.** It is fast, served from the index, and prints each match's location, qualified name, kind and **one-line signature**, which is often the whole answer. Use it whenever you can guess any part of the name. It gets more useful as you learn the naming conventions (`+-comm`, `*-assoc`, `ide-left`).
+2. **`-ss <Owner>.<name>`: long-name query.** A dotted pattern narrows the search to one module's or class's members: `-ss 'Monoid.*-comm'`.
+3. **`-ps "<shape>"`: lookup by signature shape**, when you know the type but not the name: `arend -ps "_ + _ = _ + _"`. It is slow (~20 s), but **run it before stating any helper lemma**. A `No matches` is as valuable as a hit, because it tells you the helper doesn't exist. See `-ps --help` for the grammar.
+4. **`-ch <class>` and `-fu <name>`: structure.**
+   - `-ch` prints the super- and subclass trees with their `\new` and `\instance` sites. Use it to decide which class to parameterize over, and whether to extend a class or introduce a new one.
+   - `-fu` lists every usage of a definition. It accepts a bare short name, a partial qualifier (`Monoid.pow`) or `MODULE:DEF`; an ambiguous name prints the candidates (`'pow' is ambiguous. Use one of: …`). Use it:
+     - to learn a definition's purpose from its callers;
+     - to get `No usages.` before deleting or refactoring;
+     - as an existence probe: run `-fu` on a constant that *must* occur in the lemma you're looking for. If no usage site has the right shape, the lemma doesn't exist under any name.
+5. **`-sc <referable>`: the scope at that referable's position.** Use it for "why isn't X visible here?" and "which of two same-named X is visible?". It accepts an optional `-ss`-style filter.
+6. **Sources last.** Open a file only after the flags have told you which module to open. Read the signature line and skip the body; don't grep library sources to *find* something.
+   - **Exception: before extending a module**, read the bodies of the three or four nearest definitions and note *how* they are proved: which summation API, which representation, which helper family. No name you can guess tells you that, and picking the wrong idiom costs an order of magnitude in proof length that no later cleanup recovers.
 
-2. **When you do open a source file, read the signature, not the body.** Definitions in arend-lib are signature-first: the `\func` / `\lemma` / `\class` line plus its result type is what you need to decide whether something applies. Bodies are large, meta-heavy, and rarely relevant to an existence question — skip past them.
+The tools combine: `-ss` finds candidates, `-ch` gives their structural context, `-fu` shows how to use them, and `-ps` finds them when you only know the shape.
 
-   **Exception — scout the idiom before extending an existing module.** Once you know *which* module you are adding to, read the bodies of the three or four nearest existing definitions and write down how they are *proved*, not what they are called. No name you can guess will tell you "this module reasons via `AbMonoid.FinSum` over `SigmaFin`/`PairsFinSet`, not via `BigSum` over `\new Array`" — and picking the wrong one costs an order of magnitude in proof length that no later cleanup recovers. This is the one place where reading bodies is the cheap move.
+**Then decide: postpone, reject, or proceed.** If a prerequisite is missing, don't formalize the goal on a foundation that doesn't exist yet. Either add the prerequisite first or report what's needed. If the prerequisites are there, proceed with a list of the signatures you intend to use.
 
-3. **For name-pattern lookup, use `arend -ss <pattern>` (symbol-search).** Fast, cached on-disk index. Becomes more useful as you internalize arend-lib's naming conventions (e.g., `+-comm`, `*-assoc`, `inv-r`, `iso->equiv`).
+### `-ss` grammar
 
-   **Default is case-insensitive substring on short names — *not* regex.** Reaching for `.*` or `\|` means you guessed wrong:
-   - `-ss BigSum contains=<=` for "names containing both substrings" (AND).
-   - `-ss A -ss B` for "names matching either pattern" (OR via multiple flags).
-   - `-ss "glob:Big*<="` for genuine wildcards, `-ss "re:^abs.*"` for raw regex, `-ss "hb:isP"` for camel/dash-fuzzy, `-ss "glob:exact-name"` (no wildcard chars) for an exact match. **The `eq:` mode was removed** — using it now errors out with a fix-it pointing at `glob:`.
-   - `limit=N` caps results without piping to `head`.
-
-   `-ss` matches **short names** — `Module.Foo` queries match `Foo`. To find a method on a class, query the bare method name and read the qualified result. See `-ss --help` for the full grammar.
-
-4. **Avoid grepping through `arend-lib/src/` at this stage.** Bodies are large, full of metas, and not the part you need to read to decide if something exists. Use the retrieval flags instead — grep is the fallback when you can't phrase the question as a name pattern (`-ss`) or a signature shape (`-ps`).
-
-5. **Decide: postpone, reject, or proceed.** If a prerequisite is missing, postpone or reject (and note what's needed) — don't start formalizing the goal on a foundation that doesn't exist yet. If the prerequisites are there, move to phase 2 with a list of signatures you intend to use.
-
----
-
-## Phase 2 — While formalizing: structural lookup
-
-Goal: pick the right classes, instances, and lemmas as you draft the statement.
-
-1. **`arend -ch <class>`** — print the super/sub-class hierarchy of a class, with `\new` and `\instance` sites. Use when deciding whether to introduce a new class or extend an existing one, or when figuring out which class your statement should be parameterized over.
-
-2. **`arend -fu <name>`** — find all usages of a definition. Accepts a bare short name (`arend -fu linarith`), a partial qualifier (`Monoid.pow`), or the full `MODULE:DEF` form; ambiguity is reported with the candidate list (`'pow' is ambiguous. Use one of: …`). Use when a definition's *purpose* isn't obvious from its signature (callers' pattern-of-use reveals the role); when checking whether something is used at all before refactoring (`No usages.` is the clear answer); or as a "does this fact exist under some weird name?" probe — `-fu` on a *constant* that MUST appear in the statement of the lemma you're searching for (e.g. `BigSum`, `cabs`, `partialSum`) lists every site mentioning it, so a missing match rules out the lemma's existence.
-
-3. **`arend -ps <pattern>` (proof-search)** — find lemmas by signature shape rather than name. The classic use is "I need commutativity of `+` but I don't know what it's called": `arend -ps "_ + _ = _ + _"`. Pass `-ps --help` for the grammar. **Reach for it reflexively whenever you're about to write a stating-shape lemma** — a *negative* result ("No matches") is just as valuable as a hit, since it tells you the helper genuinely doesn't exist and saves you from a wasted lemma signature. Yes, it's slow (~20s on resolution); the information value is high.
-
-These three combine: `-ss` finds candidates, `-ch` tells you the structural context, `-fu` shows you how to use them, `-ps` finds them when you only know the shape.
-
----
-
-## Phase 3 — After writing the statement: get to "only GOAL errors remain"
-
-Goal: a typechecking file where the only remaining errors are the `{?}`s representing unproven obligations. Stop here — proof work belongs to a later session and the **arend-prove** skill.
-
-1. **Update `\import`s manually first.** Add the imports you remember needing. Don't aim for completeness — the next step will fill gaps.
-
-2. **Typecheck.** The default workflow — no flag, just a positional target. Narrow the scope with the positional to keep the output readable:
-
-   - `arend .` (no target) — the whole library.
-   - `arend . <Module>` — that module and its cone.
-   - `arend . <Module>:<def>` — one definition.
-
-   With a daemon up (phase 0) these route to it automatically and return in seconds. Resolution and typechecking happen in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors. Existing `.arc` caches load unless `-r` is passed; fresh ones are written back **only if `--serialize` was given** (on the `-d` bootstrap, for daemon-served calls). Reach for `-r` only when the binaries are out of sync, typically after a class refactor — and remember it needs `--no-daemon` to have any effect, plus `--serialize` to leave a repaired cache behind.
-
-3. **Fix unresolved references by hand.** For each `Cannot resolve reference 'X'`, find the owner with `arend -ss X` — the result is qualified, so it tells you both the name to write and the module to `\import`. When several modules define the same short name, `arend -sc <referable>` dumps the ambient scope at that position and shows which one is actually visible.
-
-4. **Chase remaining typecheck errors.** Use `-ss`/`-ps`/`-fu`/`-ch` freely while triaging — these four cover most "what does this name mean / where else is this used / what's the right lemma" questions without leaving the terminal.
-
-5. **Capture knowledge as you go.**
-   - If you learned a *language-level* fact (a quirk, a syntax surprise, a typing rule that bit you), add it to `~/.claude/skills/arend-quirks/SKILL.md`.
-   - If you learned a *meta-level* fact (a failure mode, a non-obvious meta interaction), add it to `~/.claude/skills/arend-prove/SKILL.md`.
-   - If something was **cumbersome, slow, or painful** in a way that feels like a *tooling* issue rather than your mistake (typechecker quirk, slow/misleading CLI behavior, confusing diagnostic), append it to `arend-issues.md` at the repo root — `/home/sergey/Documents/Arend/arend-issues.md`. The file was deleted on 2026-05-21 (`f0c5f9dbf`) and **recreated on 2026-08-03** at the user's request to hold CLI/typechecker feature requests; its old numbered entries are gone, so never cite "`arend-issues.md` #N". **Do not** log missing library statements here — a missing lemma is not an issue, it's something to add. If a helper is missing from arend-lib, put it in the right module and move on.
-
-6. **Done when the only remaining errors are `GOAL` (unproven `{?}`s).** Type-mismatch, unresolved-reference, universe-level, and termination errors must all be gone. If any non-GOAL error remains, you're not done.
-
-7. **Re-read the final statement against the informal claim.** Variable order, implicit/explicit splits, universe levels, and class parameters all change meaning. The Arend statement that typechecks is not necessarily the formalization of what you were given — verify by hand.
-
----
-
-## Phase 4 — the finish checklist
-
-**Execute this as a pass, with the diff open, item by item. Do not run it from memory.** Every item below was violated in work that had this skill loaded, so recall is not the failure mode; execution is. Groups 5 and 7 are *experiments*: make the edit, re-typecheck, and put it back only if the typechecker objects.
-
-*Provenance: the two "Refactor AI slop" reviews — `85817d37` (2026-06-16, 43 files, −3270/+2297) and `0e2fc701` (2026-07-31) — consist almost entirely of these eight groups.*
-
-### 1. Goals and dead code
-- `grep -n '{?}'` over every file touched. A `{?}` must never reach a commit.
-- `-fu` every new definition. `No usages.` → delete it.
-- No lemma whose body is `idp`; no `pmap f idp` step; no lemma that is a partial application of another (`f a b 0`).
-- **No lemma whose body is a bare, argument-free tactic call** — `equation.group`, `equation.cRing`, `linarith`, `simplify`. If a decision procedure closes the statement unaided, writing that procedure at the call site is shorter than writing the lemma's name, so the lemma is pure decoration. A tactic *with* a hand-supplied bridge (`equation.group {pmap (* h) p}`) is the opposite: the bridge is the content, and the lemma stays. User's rule, applied to `Algebra/Group.ard` on 2026-09-14 — eight of fifteen new commutator lemmas went.
-
-### 2. Naming — check every new name against this table
-
-| Kind | Convention | Right | Wrong |
-|---|---|---|---|
-| `\Prop`/`\Type`-valued predicate or index family | Capitalised | `OnUnitCircle`, `DyadicShift`, `IsCentral` | `onUnitCircle`, `dyadic-shift` |
-| "f commutes with g" | `f_g`, underscore | `fromReal_pow`, `conv_fromRat` | `fromReal-pow`, `fromRat-conv` |
-| adjectival / qualified variant | `f-adj`, hyphen | `abs-square`, `pow_<=-degree` | — |
-| coefficient | `coef` | `compose-coef`, `coef-Rat` | `coeff` |
-| one of a directional pair | direction in the name | `exp_negative-left` / `-right` | `exp_negative` |
-| abbreviation | spell it out | `square` | `sq` |
-
-Also: no proof-plan labels in names or doc comments (`L1:`, `Step 3:`, `Main theorem:`); no file-local `\alias` for a function used fewer than ~10 times — use `\open M \using (Long \as short)`.
-
-### 3. Comments — delete on sight
-- Any comment that restates the signature in words.
-- Any comment documenting *your* workaround ("stated over an array variable so the implicits infer"; "naming it keeps `pmap` from guessing").
-- Any proof sketch duplicating the body, and any `-- Step N` marker inside a body.
-- Any comment narrating the file organisation ("supporting material lives with its subject matter").
-- Any `TODO: hoist to X` / `TODO: belongs in \where of X` — do the move now, it is two lines.
-
-Then: every surviving comment that asserts a mathematical necessity ("needs commutativity", "not cancellative at ∞") must be one you can defend. Two of mine were false.
-
-### 4. Placement
-- Exactly one consumer (`-fu`) → move into that consumer's `\where`.
-- Takes `{X : SomeClass}` and is only ever used at `X` → make it a member of the class.
-- `\where`-nested and needed by a sibling → drop `\private` or hoist to file level (**arend-quirks** §18).
-- Directory matches subject. A real-analysis statement does not live under `Algebra/Field/`.
-- No import from a higher layer: nothing under `Algebra/` imports `Analysis/` or `Topology/`. If you needed a type from there, define the algebraic one locally.
-- Delete every import no longer used.
-
-### 5. Hypotheses — try to weaken every one
-The check nobody performs by reflex, and the source of the mathematically wrong signatures.
-- Each explicit hypothesis: delete it, re-typecheck.
-- Each class parameter: replace by each superclass (`-ch <class>` lists them), re-typecheck. Real instances: `CompleteExNormedRing` → `ExPseudoNormedRing` (7 lemmas), `OrderedCRing` → `LinearlyOrderedSemiring`, `BanachAlgebra` → `QAlgebra`.
-- `Fin n` in a statement → try `{A : FinSet}`. Stated at `Fin n` it will not apply to `PairsFinSet` / `SigmaFin` / `ProdFin`, and you will re-prove it by hand.
-- `\Pi (y z : A) -> y * z = z * y` is almost always too strong: the statement usually needs one element central (`Monoid.IsCentral`).
-- Any argument that is a proposition and gets `prop-pi`'d downstream → mark `\property`.
-
-### 6. Abstraction by repetition
-- A hypothesis appearing in ≥3 signatures of this diff → name it.
-- A class combination appearing in ≥3 signatures → declare the class. (`\class RealBanachCAlgebra \extends RealBanachAlgebra, CRing` is one line and deleted ten `*-comm` arguments.)
-- Two definitions differing only in a constant → generalise one, delete the other.
-
-### 7. Redundancy — omit and re-typecheck
-- Every explicit implicit `{…}`.
-- Every type ascription `(meta : T)` — let the chain position pin the type.
-- Every `\lam (x : T) =>` binder annotation.
-- `\new Array A n (\lam i => e)` → `\lam i => e`.
-- **Qualification: `C.f {inst} args` → `inst.f args`.** Qualify with the *instance*, never with the defining class carrying the instance as an implicit. `RealField.pow x n`, not `pow {RealField} x n`. This one alone accounts for hundreds of tokens per file.
-- `\lam x => f x + e` → `` (`+ e) ``; `transport (\lam x => P x) (inv p)` → `transportInv P p`.
-- Hand-stepped `\have` chains where `simplify` / `equation.cRing` / `linarith` closes the goal outright.
-- Hand-written `\case d \as d \return (\case d \with {…}) = …` motives → `mcases \with {…}`.
-- `\case e \with { | inP (…) => body }` → `\let | (inP (…)) => e \in body`.
-
-### 8. Layout
-- Signature: parameters, then `: Result` on its own line, then `=> body`. Never `… (args) :` at end of line.
-- `\where {` on its own line, members indented one level.
-- `\have` for proofs, `\let` for values.
-- `Record R`, not `Record { | R => R }`; `| Parent => …` to reuse a parent instance rather than re-implementing its fields.
-
----
-
-## Common diagnosis recipes
-
-### "The lemma is `[GOAL]` but I didn't write `{?}` in the body"
-
-Look upstream, not at the reported def. A `[GOAL]` on a body you wrote in full usually means an *earlier* definition failed to typecheck, and the reference to it degraded into a hole. Re-run scoped to the whole module (`arend . <Module>`) rather than the one definition, and read the *first* `[ERROR]` in the output — that's the real bug; everything after it is fallout. Confirm by checking that def alone with `arend . <Module>:<upstream-name>`.
-
-### "Library compiles cleanly per-module but the full-library refresh throws `IllegalArgumentException`"
-
-Usually `linarith` / `equation` choking on a goal where the implicit algebraic class can't be inferred. Per-module checks may skip the failing path because of caching. The exception isn't attached to a source line, so you have to bisect by commenting out tactic calls. **Workaround**: replace `linarith` with an explicit lemma chain (e.g. `<_+-right`, `transport`, `zro-right`).
-
-### "Module typechecks cleanly but downstream modules report bogus type mismatches like `Rat` vs `Arith.Rat.Rat`"
-
-Stale binary cache after a class refactor. Only a forced recompile fixes it: `arend --no-daemon -r --serialize <module>`. All three flags are needed — a daemon-served `-r` is silently ignored, so without `--no-daemon` you get a warm run that reads the same stale state; and without `--serialize` the clean build writes no `.arc` at all, so the bad one survives and the next invocation is wrong again.
-
-### "The daemon insists a definition I can see doesn't resolve"
-
-Daemon poisoning: a transient resolution error (a duplicate name, a half-saved file) can leave the warm server denying a definition that is plainly present. `-r` won't help — it's one of the flags the daemon eats. Restart it: `arend . --daemon-stop && arend . -d`.
-
-### "Cannot infer implicit X" inside a `\where`-block lemma calling its outer lemma
-
-A `\where` member of a *parameterised* `\func` **does** inherit that `\func`'s parameters as hidden
-implicits — `SubMonoid.closure.univ` and `.apl-inc` use `closure`'s `M` and `S` without declaring
-them, and `-ss` prints their signatures without them. (An earlier revision of this entry said they
-are *not* inherited; that is wrong, and it is why the references resolve at all.) What does not
-happen is those implicits being *propagated* when one **sibling** calls another: there they become
-ordinary metavariables at the call site, so pass them explicitly — `outer-lemma {A} {b} {x} N`
-instead of `outer-lemma N`. Alternative: avoid `\where` and put helpers at top-level (still
-`\private`).
-
-**The parent's own body, and a member's recursive self-call, do *not* need the pinning.** Verified
-2026-09-14 on `Algebra/Group/Free.ard`: `FreeGroup.lift-unique.char` declares no parameters at all
-and uses its parent's `{S} {G} {i} {f}`; both `char a` (from `lift-unique`'s body) and `char l`
-(from `char` itself) typecheck with every implicit left out — including `i`, which does not occur in
-`char`'s type and would be an unsolvable metavariable if it were passed as one. So a one-consumer
-helper *can* be nested in its consumer's `\where` and shed its parameters; it is only the
-sibling-to-sibling edge that costs pinning. (An earlier revision said "when recursing" too — wrong.)
-
-**The second surface form is a `Type mismatch`, not `Cannot infer`.** If the sibling's parameter type
-is a class application (`(H : SubGroup G)`, `G` inherited) and you pass a `\cowith`-defined value
-whose type carries its implemented fields, the expected type is not ground when the subtype coercion
-is checked and you get a mismatch that reads as a contradiction — the solved field implementations
-are elided on the *expected* side and printed in full on the *actual* side:
-
-```
-[ERROR] Type mismatch
-  Expected type: SubGroup G
-    Actual type: SubGroup G (\lam (x : G.E) => TruncP (\Sigma (n : Nat) (contains x)))
-  In: closure S'
-```
-
-Same read-as-contradiction shape as **arend-prove** failure modes 15/18/20, same fix as above: pin
-`{G} {S}` and it goes away. Verified deterministic (13/13, warm and cold daemon) on
-`Algebra/Group/SubGroup.ard` 2026-09-14 — do not mistake this for flakiness, as I once did.
-
-**Corollary for statements, not just call sites:** `closure S <= closure S'` between two such values
-finds no `Poset` instance at all (`Cannot infer an instance of class 'Preorder' with classifying
-expression: SubGroup G (\lam x => …)`), and pinning it as `<= {SubGroupPoset}` fails the same way as
-above. State the relation pointwise instead — `(x : G) (q : closure S x) : closure S' x` *is*
-`SubsetPoset.<=` unfolded, so nothing is lost, and it is what `Ideal.sclosure-mono` already does.
-
----
-
-## Quick reference — which CLI flag for which question
-
-| Question | Flag |
-|---|---|
-| "Does a lemma of this *shape* exist?" | `-ps` |
-| "Is there a definition whose name matches X?" | `-ss` |
-| "Where is this definition used?" | `-fu` |
-| "What classes extend / instances exist for C?" | `-ch` |
-| "Why isn't X in scope here?" | `-sc` |
-| "I edited; resolve + typecheck." | no flag — `arend . <Module>[:<def>]` is the default workflow |
-| "Make the edit loop fast." | `arend . -d` once per session; every later call auto-routes to the warm daemon |
-| "Is a daemon up, and is it busy?" | `--daemon-ping` (`IDLE` / `BUSY`) |
-| "I edited sources; refresh the daemon's view." | `--daemon-refresh` (re-runs `-ai` on the warm context) |
-| "Resolution candidates + `.sig` mirror + index refresh." | `-ai [MODULE[:DEF]]` |
-| "Ignore stale binary caches after a refactor or a hang." | `--no-daemon -r` (plain `-r` is ignored by the daemon) |
-| "The daemon is wedged / denies a visible definition." | `--daemon-stop`, then `-d` again |
-| "Which definitions are slow?" | `--no-daemon -r --show-times [MODULE[:DEF]]` (`--show-sizes` for core-term sizes). A `:DEF`-scoped run checks only that definition's dependencies. Not daemon-served: the daemon re-checks only definitions whose resolved AST changed, so it reports ~0ms for the rest. For bisection, add variant definitions to a scratch copy of the library and time them all in one run. Cause and cures: **arend-quirks** §7. |
-| "Why is this definition slow?" | `--no-daemon --show-hot-spots MODULE[:DEF]`: for the 25 slowest definitions, the subexpressions the time went into (1ms samples; `incl` = inside it, `self` = innermost), so a single chain step or argument stands out. `--show-unfolds`: which definitions the normalizer unfolded, most frequent first. `-Darend.unfold.trace=NAME` (JVM option, with `--show-unfolds`; `-Darend.unfold.trace.every=N`, and `-XX:MaxJavaStackTraceDepth=20000`) prints the typechecker stack at every N-th unfolding of `NAME`. Unfold counts can point at a symptom; check with `--show-hot-spots` before changing code. Added 2026-10-16 to the local CLI (`~/Documents/Arend`, uncommitted). |
-
-### `-ss` dialect reference
-
-**`arend -ss --help` prints the authoritative grammar — run it instead of trusting this table.**
-(`arend -ss help`, no dashes, *searches for the name* "help" and returns real hits; it is an easy
-way to talk yourself into a wrong conclusion. Verified 2026-09-14.) The table below matches the
-build on branch `formalizationProject`.
-
-Plain mode is **literal substring on short names** — not regex (Arend identifiers use `*`, `^`,
-`$`, `?`, `|` freely, so these stay literal). Prefixes select other modes:
+`arend -ss --help` prints the authoritative grammar, so run it rather than trusting this table. Note that `arend -ss help`, without dashes, *searches for the name* "help".
 
 | Pattern | Meaning |
 |---|---|
-| `Foo` | substring, characters literal (`*-comm`, `^-1`, `<*`, `\|\|` all work as typed) |
-| `glob:Foo` | whole-name match; `*` = any run, `?` = one char; `\*` / `\?` for literals |
-| `glob:Foo` (no `*`/`?`) | EXACT short name — the old `eq:` mode was removed and errors with a fix-it |
-| `re:<java-regex>` | Java regex, unanchored (`find()`), case-sensitive as typed |
+| `Foo` | substring of the short name; characters are literal (`*-comm`, `^-1`, `<*`, `\|\|` work as typed) |
+| `glob:Foo` | whole-name match: `*` = any run, `?` = one char, `\*` / `\?` for literals; with no wildcard it is an **exact** name |
+| `re:<regex>` | Java regex, unanchored, case-sensitive as typed |
 | `hb:<chars>` | humpback: word starts / prefixes (`hb:PAM` → `PosetAddMonoid`, `hb:isP` → `isProp`) |
-| `A.B.C` | **long name** — dotted parts of the qualified name; last segment is the short name |
+| `A.B.C` | long name: earlier segments match enclosing module/namespace segments in order; the last is the short name |
 
-**Smart case** (every mode but `re:`): a lowercase letter matches either case, an uppercase letter
-matches uppercase only. So `monoid` finds `Monoid`, but `Monoid` skips a lowercase `monoid`.
+- **Smart case** applies in every mode but `re:`: a lowercase letter matches either case, an uppercase letter only uppercase. So `monoid` finds `Monoid`, but `Monoid` skips `monoid`.
+- **OR:** several patterns are OR'd, and whitespace inside one argument also separates them. `-ss "A B"` ≡ `-ss A -ss B`.
+- **Options**, each a separate argument:
+  - `limit=N` (0 = unlimited, default 200);
+  - `kind=k,…` from `func sfunc lemma type axiom instance coclause coerce level data cons class record field meta`;
+  - `self`, to search only the requested libraries and skip dependencies.
 
-**OR**: multiple patterns are OR'd, and whitespace inside one argument also separates — `-ss "A B C"`
-≡ `-ss A -ss B -ss C`.
+| Want | Wrong | Right |
+|---|---|---|
+| Names containing both `pow` and `<=` | `-ss "pow.*<="` (dotted → a long-name query, silent `No matches`) | `-ss "glob:*pow*<=*"`, or filter the output |
+| Exact short name | `-ss eq:pmap` (removed; errors with a fix-it) | `-ss glob:pmap` |
+| Either of two patterns | `-ss "A\|B"` (literal `\|`) | `-ss A -ss B`, or `-ss "A B"` |
+| Wildcard | `-ss "Big*<="` (literal `*`) | `-ss "glob:Big*<="` |
+| Regex | `-ss "^abs.*"` (has a dot → long-name query, `No matches`) | `-ss "re:^abs.*"` |
+| Members of one class | — | `-ss "Monoid.*-comm"` |
 
-**Options**, each its own `-ss` argument: `limit=N` (0 = unlimited, default 200); `kind=k,...` from
-`func sfunc lemma type axiom instance coclause coerce level data cons class record field meta`;
-`self` (restrict to the requested top-level libraries, skipping dependencies).
+**An unknown token is silently accepted as an extra OR'd pattern, so a filter that doesn't exist *widens* the results.** For example, `-ss BigSum 'contains=<='` returns everything bare `BigSum` returns. There is no AND filter. Each run echoes the parsed query, so **read those first lines**: they are the only sign of a misparse.
 
-**There is no `lit:`, `contains=`, `only=`, `case-sensitive` or `no-cache` on this build** — an
-earlier revision of this skill listed all five. Their absence is not benign:
-
-- **An unrecognised token is silently accepted as an extra OR'd pattern**, so a stale filter
-  *widens* the result set instead of narrowing it. `-ss BigSum contains='<='` returns
-  `AddMonoid.BigSum` (no `<=` in the name) and the same 77 matches as bare `BigSum`; `zzz=1` is
-  accepted just as happily. The echoed `Searching for (OR):` block is the only tell — **read it.**
-  For an AND of two substrings there is no filter: use `glob:`/`re:`, or filter the output.
-- **A pattern containing a dot becomes a long-name query**, not a rejected regex. `-ss 'commutator.*'`
-  echoes `long-name 'commutator.*'` and returns `No matches` — there is no "regex sequence rejected
-  with a fix-it" safety net (an earlier revision claimed one). If you typed `.*`, you got a
-  qualified-name search and a silent miss.
-
-Each run echoes the parsed query, so every misparse above is visible in the first two lines of output.
-
-### Other inspection tools — when they pay off
-
-- **`-ps <pattern>` — proof search by *signature shape*.** Slow (~20s on resolution) but unique: "is there a lemma whose parameters/codomain match this shape?". A negative result is as valuable as a hit — it tells you the helper genuinely doesn't exist. Default discipline: when about to write `\lemma foo : <shape> => {?}`, run `-ps "<shape>"` first.
-- **`-fu <name>` — every usage of a definition.** Bare short name works (`arend -fu linarith`); ambiguity prints the candidate list. Read usages when the *purpose* of a def isn't obvious from its signature; check `No usages.` when refactoring; use it on a load-bearing constant (e.g. `BigSum`, `partialSum`) to verify whether a lemma you suspect to exist could exist under a different name.
-- **`-ch <class>` — class hierarchy.** Super/sub-class trees plus `\new` and `\instance` sites. Use when deciding whether to introduce a new class or extend an existing one.
-- **`-sc <referable>` — scope dump.** Lists everything in scope at a referable's position. Right tool for "why isn't X visible here?". Accepts an optional `-ss`-style pattern to filter.
+    Searching for (OR):
+      literal 'BigSum'
+      literal 'contains=<='
 
 ---
 
-## Style and refactoring
+## 2. Draft the statement
 
-The compaction patterns now live in **Phase 4** above and are meant to be executed there, not recalled. Two that don't fit a checklist item:
-
-- hoist repeated explicit embeddings to `\use \coerce` (see **arend-quirks** §10);
-- prefer `-- |` doc comments over `{- | … -}` for one-liners (see **arend-quirks** §19 for why LaTeX in block comments is hazardous).
-
-Treat all of it as the target style *while writing*; Phase 4 is the backstop, not the plan.
-
-(There was once a separate `arend-refactor` skill holding worked examples. Its `SKILL.md` had been overwritten with a copy of `arend-error-extraneous-input`, so it was removed on 2026-07-28.)
+- **Choose the class to parameterize over from `-ch`**, not by staring at the goal. Pick the smallest structure that has what the statement needs (see *Hypotheses* in the finish checklist).
+- **Write the signatures with `{?}` bodies**, using the names collected in phase 1. Run `-ps` before stating each helper.
+- **Choose the implicit/explicit split deliberately.** A parameter that the *reduced* statement no longer mentions cannot be inferred, so make it explicit. See **arend-quirks**, *Implicit arguments*.
 
 ---
 
-## Anti-patterns
+## 3. Get to "only GOAL errors remain"
 
-- **Omitting `--serialize` and expecting warm caches.** It is opt-in: without it *no* `.arc` is written, so every run re-typechecks from source and every “forced recompile” fix evaporates. Bootstrap the daemon as `arend . -d --serialize`. (Conversely, do not reach for `--no-serialize` — no such flag.)
-- **Running the whole edit loop without a daemon.** Every call then pays JVM startup plus a full library load. `arend . -d` once at the top of the session is the single largest speedup available.
-- **Expecting `-r` to recompile while a daemon is live.** It is parsed and silently discarded. Write `--no-daemon -r`, or stop the daemon first — otherwise you'll conclude "the recompile didn't fix it" from a run that never recompiled.
-- **Reading `arend-lib/src/*.ard` to find a lemma.** Use `-ss` / `-ps` / `-fu` / `-ch` instead; open sources only once they've told you which module to open.
-- **Writing the statement first, then deciding which class to parameterize over.** That decision should come out of `-ch` in phase 2, not from staring at the goal.
-- **Chasing type errors while unresolved references remain.** Resolution and typechecking share one pass, so an unresolved name poisons every type downstream of it. Clear all `Cannot resolve reference` errors first, then re-read what's left — much of it will be gone.
-- **Treating a typechecking statement as "done" without re-reading it against the informal claim.** Step 7 of phase 3 is non-negotiable — typechecking proves consistency, not faithfulness.
-- **Skipping Phase 4 because the code typechecks.** Typechecking is the entry condition for Phase 4, not a substitute for it. The two review commits that motivated the checklist deleted ~1000 net lines of typechecking code.
-- **Re-reading the Phase 4 list instead of running it.** Several of its items were already written down elsewhere in this skill set when they were violated. The list is only worth anything as an executed pass with a re-typecheck after each group.
+Goal: a typechecking file whose only errors are the `{?}`s, the unproven obligations. Stop there; closing them is **arend-prove**'s job.
+
+1. **Add the `\import`s you remember needing.** Don't aim for completeness; the next steps fill the gaps.
+2. **Typecheck, narrowing the scope with the positional** to keep the output readable:
+   - `arend .`: the whole library;
+   - `arend . <Module>`: that module and its cone;
+   - `arend . <Module>:<def>`: one definition.
+
+   Resolution and typechecking run in the same pass, so unresolved references surface as `[ERROR]` alongside genuine type errors.
+3. **Clear every `Cannot resolve reference 'X'` first.** An unresolved name poisons every type downstream of it, so much of the rest disappears once it is fixed. `arend -ss X` gives the qualified name, which tells you both what to write and which module to `\import`. When several modules define the same short name, `arend -sc <referable>` shows which one is visible.
+4. **Chase the remaining errors** with `-ss`/`-ps`/`-fu`/`-ch`.
+5. **Capture what you learn as you go:**
+   - a language-level fact (a quirk, a syntax surprise, a typing rule that bit you) → **arend-quirks**;
+   - a meta-level fact (a failure mode, a non-obvious meta interaction) → **arend-prove**;
+   - a misleading error, once you've found its cause → the matching **arend-error-*** skill.
+
+   A missing library helper is not an issue: add it to the right module and move on. If the project keeps a file for tooling friction (e.g. `arend-issues.md` at the Arend repo root), append misleading diagnostics or slow CLI paths there.
+6. **You're done when the only remaining errors are `GOAL`.** Type mismatches, unresolved references, universe-level and termination errors must all be gone.
+7. **Re-read the final statement against the informal claim.** Variable order, implicit/explicit splits, universe levels and class parameters all change the meaning. Typechecking proves consistency, not faithfulness.
+
+---
+
+## 4. Finish checklist
+
+**Run this as a pass, with the diff open, item by item. Do not run it from memory.** Every item here has been violated in work that had this skill loaded, so the failure mode is not forgetting the items but not executing them. Typechecking is the entry condition for this checklist, not a substitute for it. Groups 5 and 7 are *experiments*: make the edit, re-typecheck, and put it back only if the typechecker objects.
+
+### 1. Goals and dead code
+- `grep -n '{?}'` over every file you touched. A `{?}` must never reach a commit.
+- `-fu` every new definition; `No usages.` → delete it.
+- No lemma whose body is `idp`, no `pmap f idp` step, and no lemma that is a partial application of another (`f a b 0`).
+- **No lemma whose body is a bare, argument-free solver call** (`equation.group`, `equation.cRing`, `linarith`, `simplify`). Writing the solver at the call site is shorter than writing the lemma's name. A solver *with* a hand-supplied bridge (`equation.group {pmap (* h) p}`) is different: the bridge is the content, so the lemma stays.
+
+### 2. Naming: check every new name against this table
+
+| Kind | Convention | Right | Wrong |
+|---|---|---|---|
+| `\Prop`/`\Type`-valued predicate or index family | Capitalised | `IsCentral`, `OnCircle` | `isCentral`, `on-circle` |
+| "f commutes with g" | `f_g`, underscore | `inverse_*`, `negative_+` | `inverse-*`, `neg-plus` |
+| adjectival / qualified variant | `f-adj`, hyphen | `abs-square`, `pow-positive` | — |
+| coefficient | `coef` | `coef-sum` | `coeff-sum` |
+| one of a directional pair | direction in the name | `cancel-left` / `cancel-right` | `cancel` |
+| abbreviation | spell it out | `square` | `sq` |
+
+Also: no proof-plan labels in names or doc comments (`L1:`, `Step 3:`, `Main theorem:`). No file-local `\alias` for a function used fewer than ~10 times; use `\open M \using (Long \as short)` instead.
+
+### 3. Comments: delete on sight
+- a comment that restates the signature in words;
+- a comment documenting *your* workaround ("stated over a variable so the implicits infer");
+- a proof sketch that duplicates the body, and any `-- Step N` marker inside a body;
+- a comment narrating the file's organisation;
+- `TODO: hoist to X` / `TODO: belongs in \where of X`: do the move now, it is two lines.
+
+Then check that every surviving comment asserting a mathematical necessity ("needs commutativity", "not cancellative at ∞") is one you can defend. Such claims are often false.
+
+### 4. Placement
+- Exactly one consumer (`-fu`) → move it into that consumer's `\where`.
+- Takes `{X : SomeClass}` and is only ever used at one `X` → make it a member of the class.
+- `\where`-nested, `\private`, and needed by a sibling → drop `\private` or hoist it to file level (see **arend-quirks**, *Syntax*).
+- The directory matches the subject: a real-analysis statement does not live under `Algebra/`.
+- No import from a higher layer. In arend-lib, nothing under `Algebra/` imports `Analysis/` or `Topology/`; if you need a type from there, define the algebraic one locally.
+- Delete every import that is no longer used.
+
+### 5. Hypotheses: try to weaken every one
+This is the check nobody performs by reflex, and it is the source of mathematically wrong signatures.
+- For each explicit hypothesis: delete it and re-typecheck.
+- For each class parameter: replace it by each superclass (`-ch <class>` lists them) and re-typecheck. A statement proved over a field often needs only a ring.
+- `Fin n` in a statement → try `{A : FinSet}`. A statement about `Fin n` will not apply to other finite sets, and you will re-prove it by hand.
+- `\Pi (y z : A) -> y * z = z * y` is almost always too strong: the statement usually needs only one element to be central (`Monoid.IsCentral`).
+- An argument that is a proposition and gets `prop-pi`'d downstream → mark it `\property`.
+
+### 6. Abstraction by repetition
+- A hypothesis that appears in ≥3 signatures of the diff → name it.
+- A class combination that appears in ≥3 signatures → declare the class. A one-line `\class C \extends A, B` can delete a repeated commutativity argument from every signature.
+- Two definitions that differ only in a constant → generalise one and delete the other.
+
+### 7. Redundancy
+Run the compaction list in **arend-prove**, *Style › Compaction*, item by item, re-typechecking after each.
+
+### 8. Layout
+- Signature: the parameters, then `: Result` on its own line, then `=> body`. Never `… (args) :` at the end of a line.
+- `\where {` on its own line, with members indented one level.
+- `\have` for proofs, `\let` for values.
+- `Record R`, not `Record { | R => R }`. Use `| Parent => …` to reuse a parent instance rather than re-implementing its fields.
+
+---
+
+## Diagnosis recipes
+
+### "The lemma is `[GOAL]` but I didn't write `{?}` in the body"
+
+Look upstream, not at the reported definition. A `[GOAL]` on a body you wrote in full usually means an *earlier* definition failed to typecheck, and the reference to it degraded into a hole. Re-run scoped to the whole module (`arend . <Module>`) and read the *first* `[ERROR]`: that is the real bug, and everything after it is fallout. To confirm, check the upstream definition alone with `arend . <Module>:<upstream-name>`.
+
+### "Each module typechecks, but the whole-library run throws `IllegalArgumentException`"
+
+This is usually `linarith` or `equation` choking on a goal where the implicit algebraic class can't be inferred. Per-module checks can skip the failing path because of caching. The exception isn't attached to a source line, so bisect by commenting out solver calls. Workaround: replace that `linarith` with an explicit lemma chain.
+
+### "Bogus errors in modules I didn't touch" / "the daemon denies a definition I can see"
+
+Stale caches or a poisoned daemon; see *Stale caches and a poisoned daemon* above.
+
+### "A definition is on screen, yet it is `Cannot resolve reference` and `-ss` finds nothing"
+
+If the index cannot see the definition, the parser never saw it either. Usually a `{-` inside an earlier comment swallowed it; see **arend-quirks**, *Comments*. (If the module itself is brand new, it may instead be index lag; see the end of section 0.)
+
+---
+
+## Quick reference
+
+| Question | Command |
+|---|---|
+| "Does a lemma of this *shape* exist?" | `-ps "<shape>"` |
+| "Is there a definition whose name matches X?" | `-ss X` (grammar: *`-ss` grammar* above) |
+| "Where is this definition used?" | `-fu <name>` |
+| "Which classes extend C / which instances exist?" | `-ch <class>` |
+| "Why isn't X in scope here?" | `-sc <referable>` |
+| "I edited; resolve + typecheck." | `arend . <Module>[:<def>]` |
+| "Make the edit loop fast." | `arend -d --serialize` once per session |
+| "Is a daemon up, and is it busy?" | `--daemon-ping` (`IDLE` / `BUSY`) |
+| "I added, deleted or renamed a module file." | `--daemon-refresh` |
+| "Errors that vanish under `-r`, a hang, bogus mismatches after a refactor." | `arend --no-daemon -r --serialize <Module>` |
+| "The daemon is wedged / denies a visible definition." | `--daemon-stop`, then `-d --serialize` |
+| "Which definitions are slow?" | `arend --no-daemon -r --show-times [MODULE[:DEF]]`, or `--show-sizes` for core-term sizes. A `:DEF`-scoped run checks only that definition's dependencies. Don't use the daemon here: it re-checks only definitions whose resolved AST changed, so it reports ~0 ms for the rest. To bisect, add variant definitions to a scratch copy of the library and time them all in one run. Causes and cures: **arend-quirks**, *Performance*. |

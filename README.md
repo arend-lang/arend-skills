@@ -32,8 +32,3 @@ for d in arend-*/; do ln -sfn "$PWD/${d%/}" ~/.claude/skills/; done
 Use `~/.claude/skills/` for skills available in every project, or
 `<project>/.claude/skills/` to scope them to one repository. Copying the
 directories instead of symlinking works equally well.
-
-## Notes
-
-Some skills reference absolute paths on the author's machine (for example the
-local checkout of `arend-lib`); adjust those to your own layout.
